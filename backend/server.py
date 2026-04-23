@@ -360,9 +360,10 @@ async def get_session(session_id: str):
     doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Session not found.")
-    # Participant-safe: never expose scores or the deliverable.
+    # Participant-safe: never expose scores, deliverable, or assistant-turn provider internals.
     doc["scores"] = None
     doc["deliverable"] = None
+    doc["conversation"] = _public_conversation(doc.get("conversation") or [])
     return SessionOut(**doc)
 
 
