@@ -16,3 +16,10 @@
 ## Fallback / seed code behaviour
 - Resume codes are issued by the server on every POST /api/sessions
   (format: XXXX-XXXX, 8 chars, uppercase alphanumeric, stored unique in Mongo).
+
+## Phase 6 handoff — completed session (scenario scored, stage=processing)
+- session_id: 4d2be235-ec1f-431e-a8a6-193c493bac26
+- resume_code: 7JSN-K45S
+- Participant: Handoff Curl / curl.handoff@example.co.uk
+- scores.scenario populated (CF=5, ST=5), via Emergent / claude-opus-4-6.
+  Use this session for Phase 7 (Synthesis + Results) work when authorised.
