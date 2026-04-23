@@ -245,12 +245,16 @@ frontend:
 
 metadata:
   created_by: "main_agent"
-  version: "0.2.0-phase2"
-  test_sequence: 1
+  version: "0.3.0-phase3"
+  test_sequence: 2
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Admin auth (login/logout/me + JWT cookie)"
+    - "Admin settings CRUD with key encryption + masking"
+    - "LLM router cascade + provider test endpoints"
+    - "Regression: Phase 2 session endpoints still pass"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -258,18 +262,107 @@ test_plan:
 agent_communication:
     - agent: "main"
       message: |
-        Phase 2 complete. Acceptance criteria 1-10 all met. Backend has 4 new session endpoints
-        all under /api with pydantic validation and are visible in /api/docs. Frontend has a new
-        /start page, a Resume modal on /, a Save & exit button on /assessment/*, and a Zustand
-        store that hydrates from localStorage (sessionId+resumeCode only, no PII). Mongo
-        `sessions` collection has the exact schema per spec with unique index on resume_code and
-        compound index on status+expires_at. No PII appears in INFO logs (verified via grep).
-        Methodology content inventory delivered separately in the main chat; documents 19, 20,
-        21, 22 are all present and usable verbatim in Phase 4/5/6. Document 23 (Synthesis Prompt)
-        is referenced but MISSING from the repo — this is the one real gap and will need to be
-        authored before Phase 7.
-        For Phase 5 AI Fluency Discussion: Claude Opus 4.6 IS available via emergentintegrations
-        as `claude-opus-4-6`. Documented for later.
+        Phase 3 complete. Doc 23 pulled from origin (361 lines). Added:
+          - Admin users collection + auto-seed steve@org-logic.io / test1234 (idempotent).
+          - JWT cookie auth (HS256, HttpOnly + Secure + SameSite=Lax, 8h expiry).
+          - Login rate limit 10/15min/IP. Generic "Invalid credentials" on any auth failure.
+          - admin_settings singleton with Fernet-encrypted api_keys.
+          - GET /api/admin/settings (masked), PUT (upsert, empty key clears slot, missing api_key keeps existing),
+            POST /api/admin/settings/test (real provider round-trip for primary/secondary/adhoc),
+            POST /api/admin/settings/test-fallback (real emergentintegrations round-trip).
+          - LLM router /app/backend/services/llm_router.py with 3-tier cascade + categoriser.
+            12 unit tests passing. Not yet wired into user-facing flows.
+          - Provider catalog /app/backend/llm_providers.py (anthropic / openai / openrouter / straico / grok)
+            with curated models sourced from emergentintegrations playbook + OpenRouter + x.ai + straico docs.
+          - Frontend: /admin/login, /admin (overview), /admin/settings — all protected, all styled to spec.
+          - Secrets (JWT_SECRET, SETTINGS_ENCRYPTION_KEY, EMERGENT_LLM_KEY) live only in /app/backend/.env,
+            which is now in .gitignore. No secret values in any git-tracked file or supervisor log.
+
+        Please test the following against http://localhost:8001 (internal) — cross-origin from localhost
+        returns *-CORS headers from the ingress which is a test-harness artifact, not a real-user issue:
+          - POST /api/admin/auth/login happy path + bad password + unknown email
+          - GET /api/admin/auth/me with cookie / without cookie (401 when missing)
+          - GET /api/admin/settings round-trip (unauth 401, authed 200 with masked key)
+          - PUT /api/admin/settings: set, clear with api_key="", partial updates
+          - POST /api/admin/settings/test: invalid Anthropic key should return ok:false with error_category "auth"
+          - POST /api/admin/settings/test-fallback: real Emergent key should return ok:true with latency_ms
+          - /api/docs should list 4 session endpoints + 6 admin endpoints = 10 total
+
+backend:
+  - task: "Admin auth + settings (Phase 3)"
+    implemented: true
+    working: true
+    file: "backend/server.py, auth_utils.py, crypto_utils.py, llm_providers.py, services/llm_router.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            All 6 admin endpoints reachable. Login + logout + me + settings + test + test-fallback verified
+            manually via curl and via browser (Playwright against farm-readiness.preview.emergentagent.com).
+            Fallback round-trip hit real Claude Opus 4.6 via Emergent LLM key, returned "OK" in 4203ms.
+            Invalid Anthropic key categorised correctly as "auth". Raw plaintext keys never leave the
+            server — frontend always sees `key_hint` masked (e.g. "sk-a\u2022\u2022\u2022\u20220001").
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 3 backend verification complete. Ran /app/backend_test_phase3.py against
+            http://localhost:8001/api. 33/33 assertions passed.
+              A. Login happy path: 200 {email:'steve@org-logic.io', role:'admin'}. Set-Cookie
+                 tra_admin_token=<jwt>; HttpOnly; Max-Age=28800; Path=/; SameSite=lax; Secure.
+                 All four attributes verified.
+              B. Wrong password -> 401 {"detail":"Invalid credentials."}. Exact match.
+              C. Unknown email -> 401 {"detail":"Invalid credentials."} — identical body,
+                 no user-existence leak.
+              D. GET /admin/auth/me without cookie -> 401 {"detail":"Not authenticated."}.
+              E. GET /admin/auth/me with cookie -> 200 {email, role}.
+              F. POST /admin/auth/logout -> 200 {"ok":true}. Response Set-Cookie clears
+                 the token with Max-Age=0 + expires in the past.
+              G. GET /admin/auth/me after logout -> 401.
+              H. GET /admin/settings without cookie -> 401.
+              I. GET /admin/settings authed -> 200 with all 6 required keys
+                 (primary, secondary, fallback_model, updated_at, updated_by, catalog).
+                 catalog.providers contains exactly {anthropic, openai, openrouter, straico, grok}.
+              J. PUT /admin/settings primary={provider:'anthropic', model:'claude-opus-4-6',
+                 api_key:'sk-ant-testkey-ABC123XYZ', label:'T1'} -> 200. Subsequent GET shows
+                 primary.has_key=true, key_hint='sk-a••••3XYZ'. Raw key "sk-ant-testkey-ABC123XYZ"
+                 NOT present anywhere in PUT or GET response bodies.
+              K. PUT primary={api_key:""} -> 200; subsequent GET shows primary:null.
+              L. PUT unknown provider 'bogusco' -> 400 "Unknown provider 'bogusco'.".
+              M. PUT unknown model 'claude-not-real' for anthropic -> 400 "Unknown model ...".
+              N. PUT unknown fallback_model 'claude-moon-42' -> 400 "Unknown fallback model ...".
+              O. POST /admin/settings/test slot=adhoc with the invalid anthropic key -> HTTP 200
+                 {ok:false, provider:'anthropic', model:'claude-opus-4-6', error_category:'auth'}.
+                 Error body references Anthropic's 401 response. Acceptable per brief.
+              P. POST /admin/settings/test slot=adhoc with unknown provider 'nobody' -> HTTP 200
+                 {ok:false, error_category:'other', error:"Unknown provider 'nobod<redacted>'"}.
+                 The api_key value was properly redacted from the error message.
+              Q. POST /admin/settings/test-fallback -> 200 {ok:true, latency_ms:3548,
+                 provider:'emergent', model:'claude-opus-4-6'} — real round-trip through
+                 emergentintegrations + Claude Opus 4.6. Matches the configured fallback_model.
+              R. Regression — POST /api/sessions still 201 with UUID session_id + XXXX-XXXX
+                 resume_code; GET /api/sessions/resume/{code} still 200.
+              S. Raw api_key 'sk-ant-testkey-ABC123XYZ' NEVER appears in any response body
+                 (GET /admin/settings, PUT /admin/settings, /api/openapi.json).
+              T. Password 'test1234' NOT present in /var/log/supervisor/backend.{out,err}.log.
+                 Raw api_key NOT present in those logs either.
+              U. /api/docs returns 200 (Swagger UI). /api/openapi.json lists all 11 endpoints:
+                 POST /api/admin/auth/login, POST /api/admin/auth/logout, GET /api/admin/auth/me,
+                 GET /api/admin/settings, PUT /api/admin/settings, POST /api/admin/settings/test,
+                 POST /api/admin/settings/test-fallback, POST /api/sessions, GET
+                 /api/sessions/resume/{resume_code}, PATCH /api/sessions/{session_id}/stage,
+                 GET /api/sessions/{session_id}.
+
+            Note on test harness: the login cookie is (correctly) marked Secure, so
+            requests.Session cannot replay it over http://localhost. The harness extracts
+            the JWT from Set-Cookie and sends it via an explicit Cookie header on every
+            subsequent authed call. Real browsers on the HTTPS preview URL replay the cookie
+            automatically — this is a test-harness workaround, not a server bug.
+
+            No code changes were made during testing. No 500s observed. No secret leaks.
+            All high-priority Phase 3 tasks are green.
     - agent: "testing"
       message: |
         Phase 2 backend verification complete. Ran /app/backend_test.py against the public

@@ -10,11 +10,16 @@ import AIDiscussion from './pages/stages/AIDiscussion';
 import Scenario from './pages/stages/Scenario';
 import Processing from './pages/stages/Processing';
 import Results from './pages/stages/Results';
+import AdminLayout from './pages/admin/AdminLayout';
+import AdminLogin from './pages/admin/AdminLogin';
+import AdminIndex from './pages/admin/AdminIndex';
+import AdminSettings from './pages/admin/AdminSettings';
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
+        {/* Public site */}
         <Route element={<SiteLayout />}>
           <Route path="/" element={<Landing />} />
           <Route path="/start" element={<Start />} />
@@ -26,6 +31,13 @@ function App() {
             <Route path="/assessment/processing" element={<Processing />} />
             <Route path="/assessment/results" element={<Results />} />
           </Route>
+        </Route>
+
+        {/* Admin (no SiteLayout / public footer) */}
+        <Route path="/admin/login" element={<AdminLogin />} />
+        <Route path="/admin" element={<AdminLayout />}>
+          <Route index element={<AdminIndex />} />
+          <Route path="settings" element={<AdminSettings />} />
         </Route>
       </Routes>
     </BrowserRouter>
