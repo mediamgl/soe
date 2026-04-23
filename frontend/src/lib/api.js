@@ -6,67 +6,40 @@ export const API_BASE = `${BACKEND_URL}/api`;
 const client = axios.create({
   baseURL: API_BASE,
   headers: { 'Content-Type': 'application/json' },
-  timeout: 90000,  // LLM calls can take a while; Claude Opus is not fast
+  timeout: 90000,
 });
 
-export async function createSession(form) {
-  const { data } = await client.post('/sessions', form);
-  return data;
-}
-
+export async function createSession(form) { const { data } = await client.post('/sessions', form); return data; }
 export async function resumeSession(resumeCode) {
   const code = (resumeCode || '').trim().toUpperCase();
   const { data } = await client.get(`/sessions/resume/${encodeURIComponent(code)}`);
   return data;
 }
-
-export async function getSession(sessionId) {
-  const { data } = await client.get(`/sessions/${encodeURIComponent(sessionId)}`);
-  return data;
-}
-
-export async function patchStage(sessionId, stage) {
-  const { data } = await client.patch(`/sessions/${encodeURIComponent(sessionId)}/stage`, { stage });
-  return data;
-}
+export async function getSession(sessionId) { const { data } = await client.get(`/sessions/${encodeURIComponent(sessionId)}`); return data; }
+export async function patchStage(sessionId, stage) { const { data } = await client.patch(`/sessions/${encodeURIComponent(sessionId)}/stage`, { stage }); return data; }
 
 // --- Psychometric ------------------------------------------------------- //
-export async function psychNext(sessionId) {
-  const { data } = await client.get(`/assessment/psychometric/next`, { params: { session_id: sessionId } });
-  return data;
-}
-export async function psychProgress(sessionId) {
-  const { data } = await client.get(`/assessment/psychometric/progress`, { params: { session_id: sessionId } });
-  return data;
-}
-export async function psychAnswer(sessionId, itemId, value, responseTimeMs) {
-  const { data } = await client.post(`/assessment/psychometric/answer`, {
-    session_id: sessionId, item_id: itemId, value, response_time_ms: responseTimeMs,
-  });
-  return data;
-}
+export async function psychNext(sessionId) { const { data } = await client.get(`/assessment/psychometric/next`, { params: { session_id: sessionId } }); return data; }
+export async function psychProgress(sessionId) { const { data } = await client.get(`/assessment/psychometric/progress`, { params: { session_id: sessionId } }); return data; }
+export async function psychAnswer(sessionId, itemId, value, responseTimeMs) { const { data } = await client.post(`/assessment/psychometric/answer`, { session_id: sessionId, item_id: itemId, value, response_time_ms: responseTimeMs }); return data; }
 
-// --- AI Fluency Discussion (Phase 5) ------------------------------------ //
-export async function aiStart(sessionId) {
-  const { data } = await client.post(`/assessment/ai-discussion/start`, { session_id: sessionId });
+// --- AI Fluency Discussion --------------------------------------------- //
+export async function aiStart(sessionId) { const { data } = await client.post(`/assessment/ai-discussion/start`, { session_id: sessionId }); return data; }
+export async function aiMessage(sessionId, content) { const { data } = await client.post(`/assessment/ai-discussion/message`, { session_id: sessionId, content }); return data; }
+export async function aiComplete(sessionId) { const { data } = await client.post(`/assessment/ai-discussion/complete`, { session_id: sessionId }); return data; }
+export async function aiState(sessionId) { const { data } = await client.get(`/assessment/ai-discussion/state`, { params: { session_id: sessionId } }); return data; }
+export async function aiRetry(sessionId) { const { data } = await client.post(`/assessment/ai-discussion/retry`, { session_id: sessionId }); return data; }
+
+// --- Strategic Scenario (Phase 6) -------------------------------------- //
+export async function scnState(sessionId) { const { data } = await client.get(`/assessment/scenario/state`, { params: { session_id: sessionId } }); return data; }
+export async function scnStart(sessionId) { const { data } = await client.post(`/assessment/scenario/start`, { session_id: sessionId }); return data; }
+export async function scnAdvance(sessionId, fromPhase, toPhase, payload) {
+  const body = { session_id: sessionId, from_phase: fromPhase, to_phase: toPhase };
+  if (payload) body.payload = payload;
+  const { data } = await client.post(`/assessment/scenario/advance`, body);
   return data;
 }
-export async function aiMessage(sessionId, content) {
-  const { data } = await client.post(`/assessment/ai-discussion/message`, { session_id: sessionId, content });
-  return data;
-}
-export async function aiComplete(sessionId) {
-  const { data } = await client.post(`/assessment/ai-discussion/complete`, { session_id: sessionId });
-  return data;
-}
-export async function aiState(sessionId) {
-  const { data } = await client.get(`/assessment/ai-discussion/state`, { params: { session_id: sessionId } });
-  return data;
-}
-export async function aiRetry(sessionId) {
-  const { data } = await client.post(`/assessment/ai-discussion/retry`, { session_id: sessionId });
-  return data;
-}
+export async function scnAutosave(sessionId, phase, partial) { const { data } = await client.post(`/assessment/scenario/autosave`, { session_id: sessionId, phase, partial }); return data; }
 
 export function apiErrorMessage(err, fallback = 'Something went wrong.') {
   const resp = err && err.response;
@@ -82,7 +55,4 @@ export function apiErrorMessage(err, fallback = 'Something went wrong.') {
   }
   return fallback;
 }
-
-export function apiErrorStatus(err) {
-  return err && err.response && err.response.status;
-}
+export function apiErrorStatus(err) { return err && err.response && err.response.status; }

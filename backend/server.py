@@ -46,6 +46,7 @@ from services.llm_router import (
     Tier,
 )
 from services import ai_discussion_service as ai_svc
+from services import scenario_service as scn_svc
 import psychometric_service
 
 ROOT_DIR = Path(__file__).parent
@@ -100,10 +101,13 @@ RATE_LIMIT_ANSWER_MAX = 60
 RATE_LIMIT_ANSWER_WINDOW = 60  # per minute
 RATE_LIMIT_AIMSG_MAX = 30
 RATE_LIMIT_AIMSG_WINDOW = 60  # per minute
+RATE_LIMIT_SCN_AUTOSAVE_MAX = 30
+RATE_LIMIT_SCN_AUTOSAVE_WINDOW = 60  # per minute
 _sessions_ip_hits: Dict[str, deque] = defaultdict(deque)
 _login_ip_hits: Dict[str, deque] = defaultdict(deque)
 _answer_ip_hits: Dict[str, deque] = defaultdict(deque)
 _aimsg_ip_hits: Dict[str, deque] = defaultdict(deque)
+_scn_autosave_hits: Dict[str, deque] = defaultdict(deque)
 
 
 def _rate_limit_check(bucket: Dict[str, deque], ip: str, max_hits: int, window_sec: int) -> bool:
@@ -952,6 +956,271 @@ async def ai_discussion_retry(payload: AIDiscCompleteIn):
         "status": "in_progress",
     }
 
+
+
+
+# --------------------------------------------------------------------------- #
+# Routes — Strategic Scenario (Phase 6)
+# --------------------------------------------------------------------------- #
+SCENARIO_PHASE_ORDER = ["read", "part1", "curveball", "part2", "done"]
+
+
+class ScnStartIn(BaseModel):
+    session_id: str
+
+
+class ScnAdvanceIn(BaseModel):
+    session_id: str
+    from_phase: Literal["read", "part1", "curveball", "part2"]
+    to_phase: Literal["part1", "curveball", "part2", "done"]
+    payload: Optional[Dict[str, Any]] = None
+
+
+class ScnAutosaveIn(BaseModel):
+    session_id: str
+    phase: Literal["part1", "part2"]
+    partial: Dict[str, Any]
+
+
+def _scn_content_for_phase(phase: str) -> Dict[str, Any]:
+    if phase == "read":
+        return scn_svc.get_read_content()
+    if phase == "part1":
+        return scn_svc.get_part1()
+    if phase == "curveball":
+        return scn_svc.get_curveball()
+    if phase == "part2":
+        return scn_svc.get_part2()
+    return {}
+
+
+def _scn_public_state(doc: Dict[str, Any]) -> Dict[str, Any]:
+    scn = doc.get("scenario") or {}
+    phase = scn.get("phase")
+    return {
+        "status": scn.get("status"),
+        "phase": phase,
+        "phase_entered_at": scn.get("phase_entered_at") or {},
+        "time_on_phase_ms": scn.get("time_on_phase_ms") or {},
+        "part1_response": scn.get("part1_response") or {},
+        "part2_response": scn.get("part2_response") or {},
+        "content": _scn_content_for_phase(phase) if phase else {},
+    }
+
+
+def _validate_trio(payload: Any) -> Dict[str, str]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="payload must be an object with q1,q2,q3")
+    out: Dict[str, str] = {}
+    for k in ("q1", "q2", "q3"):
+        v = payload.get(k, "")
+        if not isinstance(v, str):
+            raise HTTPException(status_code=422, detail=f"payload.{k} must be a string")
+        v = v.strip()
+        if not v:
+            raise HTTPException(status_code=422, detail=f"payload.{k} must not be empty")
+        if len(v) > scn_svc.MAX_ANSWER_CHARS:
+            raise HTTPException(status_code=422,
+                                detail=f"payload.{k} exceeds {scn_svc.MAX_ANSWER_CHARS} characters")
+        out[k] = v
+    return out
+
+
+async def _scn_build_tiers():
+    doc = await admin_settings_coll.find_one({"_id": SETTINGS_DOC_ID})
+    return await ai_svc.build_tiers_from_admin_settings(doc)
+
+
+@api_router.get("/assessment/scenario/state",
+                summary="Get the scenario state for this session")
+async def scenario_state(session_id: str):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return _scn_public_state(doc)
+
+
+@api_router.post("/assessment/scenario/start",
+                 summary="Start the strategic scenario (enters phase 'read')")
+async def scenario_start(payload: ScnStartIn):
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if doc.get("stage") != "scenario":
+        raise HTTPException(status_code=409, detail={
+            "message": "Scenario not yet unlocked. Complete the AI Fluency discussion first.",
+            "current_stage": doc.get("stage"),
+        })
+    scn = doc.get("scenario") or {}
+    if scn.get("status") == "completed":
+        return _scn_public_state(doc)
+    if scn.get("status") == "in_progress":
+        return _scn_public_state(doc)
+
+    now = _now_iso()
+    update = {
+        "scenario": {
+            "started_at": now,
+            "completed_at": None,
+            "status": "in_progress",
+            "phase": "read",
+            "phase_entered_at": {"read": now},
+            "part1_response": {},
+            "part2_response": {},
+            "time_on_phase_ms": {},
+            "exit_reason": None,
+        },
+        "updated_at": now,
+    }
+    await sessions_coll.update_one({"session_id": payload.session_id}, {"$set": update})
+    doc = await sessions_coll.find_one({"session_id": payload.session_id}, {"_id": 0})
+    logger.info("Scenario start session=%s", payload.session_id)
+    return _scn_public_state(doc)
+
+
+@api_router.post("/assessment/scenario/advance",
+                 summary="Advance the scenario phase")
+async def scenario_advance(payload: ScnAdvanceIn):
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    scn = doc.get("scenario") or {}
+    if scn.get("status") != "in_progress":
+        raise HTTPException(status_code=409, detail="Scenario not in progress.")
+    current = scn.get("phase")
+    if current != payload.from_phase:
+        raise HTTPException(status_code=409, detail={
+            "message": "Out-of-order advance.",
+            "expected_from_phase": current,
+            "received_from_phase": payload.from_phase,
+        })
+    # Strict forward transitions only
+    try:
+        i_from = SCENARIO_PHASE_ORDER.index(payload.from_phase)
+        i_to = SCENARIO_PHASE_ORDER.index(payload.to_phase)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="unknown phase")
+    if i_to != i_from + 1:
+        raise HTTPException(status_code=409, detail={
+            "message": "Invalid phase transition. Must advance exactly one step forward.",
+        })
+
+    # Payload validation per-phase
+    persist_part1 = None
+    persist_part2 = None
+    if payload.from_phase == "part1":
+        persist_part1 = _validate_trio(payload.payload)
+    if payload.from_phase == "part2":
+        persist_part2 = _validate_trio(payload.payload)
+
+    now = _now_iso()
+    entered_at = (scn.get("phase_entered_at") or {}).get(payload.from_phase)
+    delta_ms = 0
+    if entered_at:
+        try:
+            t0 = datetime.fromisoformat(entered_at)
+            delta_ms = max(0, int((datetime.now(timezone.utc) - t0).total_seconds() * 1000))
+        except Exception:
+            delta_ms = 0
+
+    time_on_phase = dict(scn.get("time_on_phase_ms") or {})
+    time_on_phase[payload.from_phase] = delta_ms
+    phase_entered_at = dict(scn.get("phase_entered_at") or {})
+    phase_entered_at[payload.to_phase] = now
+
+    set_fields: Dict[str, Any] = {
+        "scenario.phase": payload.to_phase,
+        "scenario.phase_entered_at": phase_entered_at,
+        "scenario.time_on_phase_ms": time_on_phase,
+        "updated_at": now,
+    }
+    if persist_part1 is not None:
+        set_fields["scenario.part1_response"] = persist_part1
+    if persist_part2 is not None:
+        set_fields["scenario.part2_response"] = persist_part2
+
+    # End-of-scenario? (advancing from part2 to done)
+    if payload.from_phase == "part2":
+        # Pull latest in case of autosaves; then ensure the payload values overwrite
+        current_part1 = (scn.get("part1_response") or {})
+        tiers = await _scn_build_tiers()
+        score_result = await scn_svc.run_scoring(current_part1, persist_part2, tiers)
+        if score_result.get("ok"):
+            sa = score_result["payload"]["scenario_analysis"]
+            sa["_meta"] = {
+                "provider": score_result.get("provider"),
+                "model": score_result.get("model"),
+                "fallbacks_tried": score_result.get("fallbacks_tried", 0),
+            }
+            score_payload = sa
+        else:
+            score_payload = {
+                "_raw": score_result.get("raw"),
+                "_error": score_result.get("error"),
+                "scoring_error": True,
+            }
+        scores = dict(doc.get("scores") or {})
+        scores["scenario"] = score_payload
+        set_fields["scores"] = scores
+        set_fields["scenario.status"] = "completed"
+        set_fields["scenario.completed_at"] = now
+        # Advance the session stage to "processing" (the next stage, per existing STAGE_ORDER)
+        set_fields["stage"] = "processing"
+
+    await sessions_coll.update_one({"session_id": payload.session_id}, {"$set": set_fields})
+    doc = await sessions_coll.find_one({"session_id": payload.session_id}, {"_id": 0})
+    logger.info("Scenario advance session=%s from=%s to=%s delta_ms=%d",
+                payload.session_id, payload.from_phase, payload.to_phase, delta_ms)
+    return _scn_public_state(doc)
+
+
+@api_router.post("/assessment/scenario/autosave",
+                 summary="Autosave partial answers in the current writing phase")
+async def scenario_autosave(payload: ScnAutosaveIn, request: Request):
+    ip = _client_ip(request)
+    if not _rate_limit_check(_scn_autosave_hits, ip, RATE_LIMIT_SCN_AUTOSAVE_MAX, RATE_LIMIT_SCN_AUTOSAVE_WINDOW):
+        raise HTTPException(status_code=429, detail="Too many autosave writes. Please slow down.")
+
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    scn = doc.get("scenario") or {}
+    if scn.get("status") != "in_progress":
+        raise HTTPException(status_code=409, detail="Scenario not in progress.")
+    if scn.get("phase") != payload.phase:
+        raise HTTPException(status_code=409, detail={
+            "message": "Autosave phase mismatch.",
+            "expected_phase": scn.get("phase"),
+            "received_phase": payload.phase,
+        })
+    partial = payload.partial or {}
+    allowed_keys = {"q1", "q2", "q3"}
+    extra = set(partial.keys()) - allowed_keys
+    if extra:
+        raise HTTPException(status_code=422, detail=f"Unknown keys in partial: {sorted(extra)}")
+
+    # Merge into existing response trio (strings only, trimmed, capped)
+    field = "scenario.part1_response" if payload.phase == "part1" else "scenario.part2_response"
+    current = dict(scn.get(
+        "part1_response" if payload.phase == "part1" else "part2_response"
+    ) or {})
+    for k, v in partial.items():
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            raise HTTPException(status_code=422, detail=f"partial.{k} must be a string")
+        if len(v) > scn_svc.MAX_ANSWER_CHARS:
+            raise HTTPException(status_code=422,
+                                detail=f"partial.{k} exceeds {scn_svc.MAX_ANSWER_CHARS} characters")
+        current[k] = v
+    now = _now_iso()
+    await sessions_coll.update_one(
+        {"session_id": payload.session_id},
+        {"$set": {field: current, "updated_at": now}},
+    )
+    logger.debug("Scenario autosave session=%s phase=%s keys=%s",
+                 payload.session_id, payload.phase, sorted(partial.keys()))
+    return {"saved_at": now}
 
 
 # --------------------------------------------------------------------------- #
