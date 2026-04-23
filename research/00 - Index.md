@@ -68,6 +68,8 @@ A demonstration of concept has been published here: [Leadership Transformation R
 
 22. [[22 - Strategic Scenario]] — Meridian Energy Holdings scenario with curveball; assesses Cognitive Flexibility and Systems Thinking
 
+23. [[23 - Synthesis Prompt]] — Integration logic for combining all inputs into coherent, evidence-based output report
+
 ---
 
 ## Key Themes Across This Research
@@ -140,7 +142,7 @@ Traditional assessment focuses on track record—what leaders have accomplished.
 
 | **Metric** | **Value** |
 |------------|-----------|
-| Documents | 21 |
+| Documents | 22 |
 | Key themes | 4 |
 | Capability dimensions | 16 |
 | Assessment methods | 5 |
