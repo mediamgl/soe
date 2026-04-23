@@ -110,12 +110,80 @@ user_problem_statement: |
 backend:
   - task: "Admin dashboard + lifecycle + exports (Phase 8)"
     implemented: true
-    working: false
+    working: true
     file: "backend/server.py, backend/services/lifecycle_service.py, backend/services/dashboard_summary.py, backend/services/conversation_export.py"
-    stuck_count: 1
+    stuck_count: 0
     priority: "high"
-    needs_retesting: true
+    needs_retesting: false
     status_history:
+        - working: true
+          agent: "testing"
+          comment: |
+            D3 re-verification PASS (2026-04-23, post-fix). Ran /app/d3_retest.py
+            against https://farm-readiness.preview.emergentagent.com/api. The
+            surgical fix in get_session (server.py:371-396) correctly pops
+            admin_notes, last_admin_viewed_at, deleted_at, hard_delete_at,
+            redacted, and reduces synthesis to exactly {status, started_at,
+            completed_at}.
+
+            Evidence on Ada session 2253141a-830f-4810-a683-890f098b5664:
+
+              1. PATCH /api/admin/sessions/{id} {notes:"private admin note
+                 (D3 re-verify)"} -> 200; admin response body carries
+                 admin_notes == that exact string. ✓
+
+              2. Public GET /api/sessions/{id} (no cookie) -> 200.
+                 - admin_notes              : ABSENT ✓
+                 - last_admin_viewed_at     : ABSENT ✓
+                 - deleted_at               : ABSENT ✓
+                 - hard_delete_at           : ABSENT ✓
+                 - redacted                 : ABSENT ✓
+                 - scores                   : null  ✓
+                 - deliverable              : null  ✓
+                 - synthesis keys           : exactly
+                   {'completed_at','started_at','status'} ✓
+                 - synthesis.provider       : ABSENT ✓
+                 - synthesis.model          : ABSENT ✓
+                 - synthesis.fallbacks_tried: ABSENT ✓
+                 - synthesis.error          : ABSENT ✓
+                 Public top-level keys now = [ai_discussion, answers, archived,
+                 completed_at, consent, conversation, created_at, deliverable,
+                 expires_at, participant, psychometric, resume_code, scenario,
+                 scenario_responses, scores, session_id, stage, status,
+                 synthesis, updated_at]. No admin-only surface leaks.
+
+              3. Admin GET /api/admin/sessions/{id} (with tra_admin_token
+                 cookie) -> 200. Still exposes:
+                 - admin_notes              : "private admin note (D3 re-verify)" ✓
+                 - last_admin_viewed_at     : "2026-04-23T19:13:18.015680+00:00" ✓
+                 - hard_delete_at           : null (Ada never soft-deleted; key
+                                              present) ✓
+                 - synthesis.provider       : present ✓
+                 - synthesis.model          : present ✓
+                 - synthesis.fallbacks_tried: present ✓
+                 - synthesis.error          : present (null) ✓
+                 NOTE: `deleted_at` and `redacted` are absent from the raw
+                 Mongo doc because Ada was never soft-deleted — admin_get_session
+                 (server.py:1903-1915) is a pass-through of whatever is in
+                 Mongo, so those optional fields only appear post-delete. This
+                 is expected Phase-8 behaviour and was already documented in
+                 the prior Phase-8 sweep (E2/E3). Admin surface is unchanged
+                 by the fix — the fix touched ONLY the public handler.
+
+              4. D1/D2 archive-toggle regression — GREEN.
+                 - PATCH {archived:true}  -> archived=True, expires_at=None,
+                   hard_delete_at=None. ✓
+                 - PATCH {archived:false} -> archived=False, expires_at
+                   restored to "2026-06-22T18:02:27.176397+00:00" =
+                   completed_at + 60d exactly (delta=60.0 days). ✓
+
+            Test cleanup: admin_notes was cleared back to empty string after
+            the sweep. No code changes made during testing.
+
+            All other Phase-8 behaviour (A, B1-B8, C1-C2, D1-D2, D4, E1-E5,
+            F1-F2, G1, H1-H5, I1-I4, J1-J3, K1-K6, L1-L7, M, N) remains as
+            verified in the prior sweep. Marking Phase 8 as working=true,
+            needs_retesting=false.
         - working: false
           agent: "testing"
           comment: |
@@ -1910,3 +1978,31 @@ backend:
         Main agent: please address the D3 leak (small handler patch).
         Everything else is ready to ship.
 
+
+    - agent: "testing"
+      message: |
+        D3 re-verification PASS after the surgical fix to get_session
+        (server.py:371-396). 18/18 assertions green on
+        https://farm-readiness.preview.emergentagent.com/api.
+
+        Public GET /api/sessions/{Ada} now:
+          - omits admin_notes, last_admin_viewed_at, deleted_at,
+            hard_delete_at, redacted
+          - scores=null, deliverable=null
+          - synthesis = exactly {status, started_at, completed_at}
+            (no provider / model / fallbacks_tried / error)
+
+        Admin GET /api/admin/sessions/{Ada} still exposes the full set
+        (admin_notes, last_admin_viewed_at, synthesis internals). The
+        `deleted_at` and `redacted` keys are absent on Ada because she
+        was never soft-deleted — admin_get_session is a pass-through,
+        so those optional fields only materialise post-delete. Expected
+        Phase-8 behaviour; admin surface untouched by the fix.
+
+        D1/D2 archive-toggle regression also green:
+          PATCH {archived:true}  -> expires_at=null, hard_delete_at=null
+          PATCH {archived:false} -> expires_at restored to
+                                     completed_at + exactly 60d
+
+        Phase 8 task updated to working=true, needs_retesting=false,
+        stuck_count=0. Test note was cleaned up post-run.

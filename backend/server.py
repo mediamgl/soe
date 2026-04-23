@@ -372,10 +372,27 @@ async def get_session(session_id: str):
     doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Session not found.")
-    # Participant-safe: never expose scores, deliverable, or assistant-turn provider internals.
+    # Participant-safe: never expose scores, deliverable, or admin-only fields.
+    # (Phase 8 added several admin-scoped fields; none may leak to the public read.)
     doc["scores"] = None
     doc["deliverable"] = None
     doc["conversation"] = _public_conversation(doc.get("conversation") or [])
+    for admin_only in (
+        "admin_notes",
+        "last_admin_viewed_at",
+        "deleted_at",
+        "hard_delete_at",
+        "redacted",
+    ):
+        doc.pop(admin_only, None)
+    # Synthesis: keep `status` so the participant can poll, strip internals.
+    synthesis = doc.get("synthesis")
+    if isinstance(synthesis, dict):
+        doc["synthesis"] = {
+            "status": synthesis.get("status"),
+            "started_at": synthesis.get("started_at"),
+            "completed_at": synthesis.get("completed_at"),
+        }
     return SessionOut(**doc)
 
 
