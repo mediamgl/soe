@@ -31,6 +31,7 @@ All research documents are in the `/research` folder. Start with [00 - Index.md]
 | [20 - Psychometric Items](research/20%20-%20Psychometric%20Items.md) | Learning Agility + Ambiguity Tolerance scales |
 | [21 - AI Fluency Interviewer](research/21%20-%20AI%20Fluency%20Interviewer.md) | AI interviewer prompt and scoring |
 | [22 - Strategic Scenario](research/22%20-%20Strategic%20Scenario.md) | Meridian Energy scenario with curveball |
+| [23 - Synthesis Prompt](research/23%20-%20Synthesis%20Prompt.md) | Integration logic for final output report |
 
 ## The Framework
 
