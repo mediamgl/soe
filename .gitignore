@@ -28,6 +28,10 @@ Thumbs.db
 
 # Emergent / tooling
 .emergent/private/
+
+# Memory / test artefacts (contain admin creds + test session ids; never commit)
+memory/test_credentials.md
+memory/*.md.bak
 -e 
 # Environment and credential files
 .env
