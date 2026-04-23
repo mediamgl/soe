@@ -108,6 +108,185 @@ user_problem_statement: |
   a Save & exit affordance and localStorage hydrate. Placeholder stages remain placeholders.
 
 backend:
+  - task: "Strategic Scenario endpoints + scoring (Phase 6)"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/services/scenario_service.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 6 backend sweep complete. Ran /app/backend_test_phase6.py against
+            http://localhost:8001/api. 46/46 assertions passed across letters A–I.
+            ONE live Emergent scoring call consumed (14358ms, claude-opus-4-6, score CF=5
+            conf=high, ST=4 conf=high, no scoring_error, fallbacks_tried=0).
+
+              A. OpenAPI /api/openapi.json enumerates exactly 25 /api/* paths; all four
+                 new scenario routes present:
+                 /api/assessment/scenario/{state,start,advance,autosave}.
+              B. Doc 22 content fidelity (spot-check via state.content payload):
+                 B1. read.title == "Meridian Energy Holdings" ✓
+                 B2. body_sections length == 6 ✓
+                 B3. body_sections heading order == [None, "Financial Position",
+                     "Workforce", "Market Dynamics", "Stakeholder Landscape",
+                     "Recent Data Points"] ✓
+                 B4. part1.questions length == 3 ✓
+                 B5. curveball.items length == 3 ✓
+                 B6. curveball items all have integer `number` + non-empty heading + body ✓
+                 B7. part2.questions length == 3 ✓
+              C. GET /state + POST /start edge cases:
+                 C1. unknown session_id -> 404 ✓
+                 C2. pre-start (stage=identity) state returns {status:null, phase:null,
+                     phase_entered_at:{}, time_on_phase_ms:{}, part1_response:{},
+                     part2_response:{}, content:{}} — exact match ✓
+                 C3. POST /start while stage != 'scenario' -> 409 with detail.message
+                     "Scenario not yet unlocked. Complete the AI Fluency discussion first."
+                     and current_stage present ✓
+                 C4. POST /start unknown session -> 404 ✓
+                 C5. Idempotency: calling /start twice on an in-progress session returns
+                     identical {status:in_progress, phase:read} and phase_entered_at.read
+                     is preserved byte-for-byte on the second call (no re-init) ✓
+              D. POST /advance transitions + validation:
+                 D1. from_phase mismatch (claim part1 while actually at read) -> 409
+                     {message:"Out-of-order advance.", expected_from_phase:"read",
+                     received_from_phase:"part1"} ✓
+                 D2. Non-adjacent forward skip (read -> curveball) -> 409 ✓
+                 D3. Trio missing q3 -> 422 ✓
+                 D4. Trio with whitespace-only q2 -> 422 ✓
+                 D5. Non-string q1 (integer) -> 422 ✓
+                 D6. q1 with 4001 chars -> 422 ✓
+                 D7. advance with unknown session_id -> 404 ✓
+              E. POST /autosave:
+                 E1. phase mismatch (claim part2 while at part1) -> 409 ✓
+                 E2. Unknown partial key (q99) -> 422 ✓
+                 E3. Non-string value (int) -> 422 ✓
+                 E4. 4001-char string -> 422 ✓
+                 E5. Save q1 only -> 200 with saved_at timestamp ✓
+                 E6. Subsequent save of q2 -> merge preserves q1; final part1_response
+                     == {q1:"first draft value", q2:"second answer"} ✓
+                 E7. autosave unknown session -> 404 ✓
+              F. LIVE end-to-end happy path (one session, one scoring call):
+                 Drove fresh session through identity -> context -> psychometric (20×
+                 value=4) -> ai-discussion (3 live turns + /complete) -> scenario
+                 start -> part1 (rich trio ~650 chars/answer) -> curveball -> part2
+                 (rich trio ~750 chars/answer) -> advance(part2->done). The final
+                 advance took 14358ms via Emergent (Claude Opus 4.6):
+                 F1. response.status=="completed", response.phase=="done" ✓
+                 F2. time_on_phase_ms.part2 populated (integer ≥0) ✓
+                 F3. session.stage == "processing" (verified via public GET
+                     /sessions/{id}) ✓
+                 F4. Public GET /sessions/{id} still returns scores=null,
+                     deliverable=null ✓
+                 F5. scores.scenario has no scoring_error flag ✓
+                 F6. cognitive_flexibility.{score:5 (int, 1-5), confidence:"high" ∈
+                     {high,medium,low}, evidence} with evidence object carrying
+                     non-empty part1_position/part2_revision/revision_quality/
+                     key_quote all as strings ✓
+                 F7. systems_thinking.{score:4, confidence:"high", evidence} with
+                     connections_identified:list[str], connections_missed:list[str],
+                     key_quote:str ✓
+                 F8. additional_observations has stakeholder_awareness, ethical_reasoning,
+                     analytical_quality — all non-empty strings ✓
+                 F9. _meta == {provider:"emergent", model:"claude-opus-4-6",
+                     fallbacks_tried:0} ✓
+                 F10. scoring model ("claude-opus-4-6") matches admin_settings.
+                      fallback_model ("claude-opus-4-6") ✓
+                 F11. scenario.status=="completed", scenario.completed_at populated
+                      (e.g. "2026-04-23T15:59:43.862658+00:00") ✓
+              G. Regression spot-check Phases 2-5:
+                 G1. POST /sessions 201 + GET /sessions/resume/{code} 200 ✓
+                 G2. Admin login + GET /admin/settings 200 with fallback_model key ✓
+                 G3. GET /assessment/psychometric/next 200 with item ✓
+                 G4. POST /assessment/psychometric/answer 200 ✓
+                 G5. POST /assessment/ai-discussion/start while stage=='identity'
+                     -> 409 (gate still correct) ✓
+              H. Phase-5 J fix still in effect: after the live ai-discussion run in F,
+                 public GET /sessions/{id} conversation[] contains 4 assistant turns
+                 (opener + 3 replies) and ZERO of them expose provider / model /
+                 latency_ms / fallbacks_tried. `_public_conversation` at server.py:370
+                 is correctly applied. ✓
+              I. Log hygiene: /var/log/supervisor/backend.*.log scanned for INFO-level
+                 occurrences of admin password "test1234", API-key prefixes "sk-ant-"
+                 and "sk-emergent-", the test email domain "@meridian-test.example.co.uk",
+                 participant name "Priya Ashworth-Wainwright", and answer-content needle
+                 "debt covenant". Zero INFO-level hits across all needles. Participant
+                 names/emails/contents only surface at DEBUG or in structured internals
+                 that don't get logged. ✓
+
+            Robustness (scoring_error path): verified by code review of
+            server.py:1146-1164 + scenario_service.run_scoring lines 534-607. If the
+            router cascade raises LLMRouterError or the validator keeps failing after
+            2 attempts, the handler writes scores.scenario = {scoring_error:true,
+            _raw, _error} and still advances the stage; scenario.status="completed"
+            is still set. Not exercised live (conserving Emergent budget) but the
+            code path is sound.
+
+            Rate-limit on autosave: verified the bucket _scn_autosave_hits is
+            registered on every call (successful E5-E7 requests populated the bucket
+            observably; 30/min/IP cap from RATE_LIMIT_SCN_AUTOSAVE_MAX). Not
+            exhausted to avoid contaminating subsequent tests.
+
+            Test-harness notes: fresh X-Forwarded-For per session creation to avoid
+            the 10/hr POST /sessions per-IP limit across 4 sessions; admin JWT
+            extracted from Set-Cookie and replayed via explicit Cookie header
+            (Secure cookie can't replay over http://localhost via requests.Session
+            — not a server bug).
+
+            No code changes were made during testing. No 500s observed. No secret
+            leaks. All Phase 6 backend tasks are green. Main agent can summarise
+            and close Phase 6.
+
+        - working: "NA"
+          agent: "main"
+          comment: |
+            Phase 6 implementation complete. Added:
+              - services/scenario_service.py — parses /app/research/22 - Strategic Scenario.md
+                at import time. Validates doc shape (5 named body sections in order, exactly
+                3 Part-1 questions, 3 curveball items, 3 Part-2 questions). Exposes
+                get_read_content / get_part1 / get_curveball / get_part2 with
+                duration_target_minutes (4/5/4/4, picked from the upper end of Doc 22 ranges;
+                timers count UP past target, NO auto-submit). Doc 22 content counts:
+                title=\"Meridian Energy Holdings\", body_sections=6 (1 unnamed intro + 5
+                named), part1_qs=3, curveball_items=3, part2_qs=3.
+              - Scoring prompt assembled verbatim from Doc 22 Scoring Criteria + Response
+                Analysis Guidance + explicit JSON-only output schema. Validator covers both
+                dimensions (cognitive_flexibility: evidence as object with
+                part1_position/part2_revision/revision_quality/key_quote; systems_thinking:
+                evidence as object with connections_identified[]/connections_missed[]/
+                key_quote; plus additional_observations object).
+              - 4 new participant endpoints under /api/assessment/scenario:
+                  GET  /state     — returns status, phase, phase_entered_at, time_on_phase_ms,
+                                    part1_response, part2_response, plus phase-appropriate
+                                    content (read|part1|curveball|part2).
+                  POST /start     — gate: session.stage must == 'scenario'. Initialises
+                                    scenario.{started_at,status=in_progress,phase=read,
+                                    phase_entered_at{read},empty trios}. Idempotent if
+                                    already in_progress or completed.
+                  POST /advance   — strict single-step forward transitions only
+                                    (read->part1->curveball->part2->done). Validates trio
+                                    on part1/part2 submit (q1/q2/q3 strings, trimmed,
+                                    non-empty, ≤4000 chars). On from=part2 -> to=done:
+                                    runs scn_svc.run_scoring via llm_router 3-tier cascade
+                                    (up to 2 LLM attempts if JSON/schema malformed), writes
+                                    scores.scenario with _meta{provider,model,fallbacks_tried}
+                                    on success or {scoring_error:true,_raw,_error} on failure;
+                                    sets scenario.status=completed, scenario.completed_at,
+                                    and advances session.stage to 'processing'.
+                  POST /autosave  — merges partial{q1?,q2?,q3?} into the current phase's
+                                    response trio. Rate-limited per IP. Rejects unknown
+                                    keys (422) and phase mismatches (409).
+              - 17 unit tests in tests/test_scenario_service.py all pass (doc parse invariants,
+                JSON block extractor, schema validator positive+negative, dimension rubric
+                shape, scoring-prompt composition sanity).
+              - Playwright E2E already green: walks start -> read -> part1 -> curveball
+                -> part2 -> submit -> lands on /assessment/processing.
+              - Not yet verified: deep_testing_backend_v2 sweep of the four scenario
+                endpoints, end-to-end live scoring via the router, scoring_error path,
+                and full regression of Phases 2-5 under the new code.
+
   - task: "Sessions API: POST, GET, PATCH stage, resume"
     implemented: true
     working: true
@@ -251,13 +430,110 @@ metadata:
 
 test_plan:
   current_focus:
-    - "AI Discussion endpoints (start/message/complete/state/retry)"
-    - "LLM router 3-tier cascade under live calls"
-    - "Scoring JSON parse + retry + graceful failure"
-    - "Regression: Phase 2-4 endpoints"
+    - "Strategic Scenario endpoints (start/advance/autosave/state) — Phase 6"
+    - "Scenario scoring via LLM router 3-tier cascade (live call on advance part2->done)"
+    - "Scoring JSON parse + schema validation + retry-on-malformed + scoring_error path"
+    - "Regression: Phase 2-5 endpoints + Phase 5 J fix (public conversation shape)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 6 (Strategic Scenario) backend is code-complete and Playwright-verified
+        end-to-end on the frontend; now requesting a thorough deep_testing_backend_v2
+        sweep of the four new endpoints under /api/assessment/scenario before I hand
+        Phase 6 back to the user.
+
+        Please test against http://localhost:8001/api (internal; matches prior phases).
+
+        Targets:
+          1. GET /assessment/scenario/state
+             - unknown session_id -> 404
+             - pre-start (stage=identity/...) -> returns {status:null, phase:null,
+               phase_entered_at:{}, time_on_phase_ms:{}, part1_response:{},
+               part2_response:{}, content:{}}
+             - mid-phase -> returns correct phase + phase-appropriate content block
+               (body_sections for read; preamble+questions for part1/part2; items for
+               curveball).
+
+          2. POST /assessment/scenario/start
+             - gate: session.stage != 'scenario' -> 409 with detail.message
+               "Scenario not yet unlocked. Complete the AI Fluency discussion first."
+               and current_stage.
+             - happy path from stage='scenario' -> 200, scenario.status='in_progress',
+               phase='read', phase_entered_at.read set.
+             - idempotency: call twice -> same public state, no double-initialisation.
+
+          3. POST /assessment/scenario/advance
+             - invalid transitions: wrong from_phase, skip, backward -> 409/422.
+             - trio validation on part1->curveball and part2->done:
+                 missing/empty q1/q2/q3 -> 422, >4000 chars -> 422,
+                 non-string values -> 422.
+             - time_on_phase_ms for the exited phase is set to a sensible positive
+               integer.
+             - CRITICAL: from=part2 to=done runs scoring via llm_router cascade.
+               Expect provider='emergent' (the only tier configured), model matches
+               admin_settings.fallback_model, fallbacks_tried=0. scores.scenario
+               populated with scenario_analysis.{cognitive_flexibility, systems_thinking,
+               additional_observations} and _meta. session.stage advances to
+               'processing'. session.scenario.status='completed', completed_at set.
+             - Robustness: confirm that if scoring fails (we won't force this, but
+               confirm the code path exists), session.scores.scenario carries
+               {scoring_error:true, _raw, _error} and the stage still advances.
+               (You can assert this by code review; don't try to break the live LLM.)
+
+          4. POST /assessment/scenario/autosave
+             - phase mismatch -> 409.
+             - unknown partial keys -> 422.
+             - non-string value -> 422, >4000 chars -> 422.
+             - merges partial into current trio without overwriting absent keys.
+             - rate limit is enforced (don't need to exhaust it; just confirm the
+               handler registers hits).
+
+          5. Public vs admin read:
+             - GET /api/sessions/{id} must NOT expose scores or deliverable (still null),
+               but scenario state (phase, part1_response, part2_response, time_on_phase_ms)
+               is expected to be visible for hydration.
+             - GET /api/admin/sessions/{id} (authed) exposes the full scores.scenario.
+
+          6. Doc 22 content fidelity (spot-check via the content payload):
+             - read.title == 'Meridian Energy Holdings' (from '**Scenario: Meridian
+               Energy Holdings**' header).
+             - read.body_sections has 6 entries (1 intro + 5 named: Financial Position,
+               Workforce, Market Dynamics, Stakeholder Landscape, Recent Data Points).
+             - part1.questions has length 3, postamble mentions "4-5 minutes".
+             - curveball.items has length 3 with numbered heading+body.
+             - part2.questions has length 3, postamble mentions "3-4 minutes".
+
+          7. OpenAPI: /api/openapi.json should include all four scenario paths and
+             list 25 /api/* paths total.
+
+          8. Regression — confirm Phase 2-5 endpoints still respond correctly
+             (/api/sessions CRUD, admin auth, psychometric /next+/answer, ai-discussion
+             /start+/message+/complete+/state+/retry, admin /settings,
+             /settings/test-fallback). Include the earlier Phase 5 J minor fix:
+             GET /api/sessions/{id} conversation[] assistant turns must NOT carry
+             provider/model/latency_ms/fallbacks_tried (that is the _public_conversation
+             stripping).
+
+          9. Log hygiene: no INFO-level emission of participant names, email, answer
+             content, API keys, or full prompts in /var/log/supervisor/backend.*.log.
+
+        Admin credentials (for /api/admin/sessions/{id}):
+          email: steve@org-logic.io
+          password: test1234
+
+        The cookie is Secure, so drive admin calls via an explicit Cookie header on
+        localhost (same pattern used in Phases 3-5).
+
+        Live LLM budget: the scoring call on advance->done will burn one real
+        Emergent/Claude Opus 4.6 call per session you run through. One end-to-end
+        success is enough; don't replay unnecessarily.
+
+        After the sweep, please update this task's status_history and set
+        needs_retesting=false if green.
 
 agent_communication:
     - agent: "main"
