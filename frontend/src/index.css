@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    @apply bg-paper text-ink font-sans;
+    font-feature-settings: 'ss01', 'cv11';
+  }
+  h1, h2, h3, h4 {
+    @apply font-serif text-navy;
+  }
+  p {
+    @apply leading-relaxed;
+  }
+  /* Visible focus rings for keyboard users */
+  :focus-visible {
+    outline: 2px solid #d4a84b;
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 bg-navy text-white px-7 py-3 text-sm tracking-wider uppercase font-medium transition-colors duration-200 hover:bg-navy-dark focus:outline-none;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 border border-navy text-navy px-7 py-3 text-sm tracking-wider uppercase font-medium transition-colors duration-200 hover:bg-navy hover:text-white focus:outline-none;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 text-navy px-4 py-2 text-sm tracking-wider uppercase font-medium transition-colors duration-200 hover:text-navy-dark focus:outline-none;
+  }
+  .gold-rule {
+    @apply block h-px w-12 bg-gold;
+  }
+  .card {
+    @apply bg-white border border-hairline p-8 relative transition-colors duration-200;
+  }
+  .card-gold-top {
+    @apply before:absolute before:inset-x-0 before:top-0 before:h-[3px] before:bg-gold;
+  }
+  .eyebrow {
+    @apply text-xs tracking-wider2 uppercase text-gold font-medium;
+  }
+}
