@@ -52,3 +52,21 @@
     @apply w-full bg-white border border-hairline px-4 py-3 text-base text-ink font-sans transition-colors duration-150 focus:border-navy focus:outline-none placeholder:text-muted;
   }
 }
+
+/* Print stylesheet — make the Results page print as a clean executive brief */
+@media print {
+  @page { size: A4; margin: 20mm 18mm; }
+  html, body { background: #fff !important; }
+  /* Hide site nav + footers + anything marked print-hidden */
+  header, nav, footer, .print\:hidden { display: none !important; }
+  /* Colour-coded chips need their background on print */
+  .bg-navy, .bg-gold, [class*="b85c38"] {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  /* Don't split report sections across pages mid-heading */
+  section { break-inside: auto; }
+  h1, h2, h3 { break-after: avoid; }
+  /* Tighten body copy slightly for print */
+  body { font-size: 11pt; }
+}

@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ cover.title }} — {{ participant.first_name }}</title>
+<style>
+@page { size: A4; margin: 22mm 20mm 22mm 20mm; }
+* { box-sizing: border-box; }
+html, body {
+  font-family: "Source Serif Pro", "Georgia", "Times New Roman", serif;
+  color: #0b172a;
+  font-size: 10.5pt;
+  line-height: 1.55;
+  margin: 0;
+  padding: 0;
+}
+h1, h2, h3 { font-family: "Playfair Display", "Georgia", serif; color: #1e3a5f; font-weight: 600; }
+h1 { font-size: 22pt; margin: 0 0 6pt 0; letter-spacing: -0.01em; }
+h2 { font-size: 15pt; margin: 22pt 0 8pt 0; page-break-after: avoid; border-top: 1px solid #d4a84b; padding-top: 10pt; }
+h3 { font-size: 11.5pt; margin: 14pt 0 4pt 0; page-break-after: avoid; }
+p { margin: 6pt 0 8pt 0; }
+em, i { color: #3c4b66; }
+strong { color: #0b172a; }
+hr { border: none; border-top: 1px solid #d4a84b; margin: 14pt 0 8pt 0; }
+ul { margin: 6pt 0 10pt 18pt; padding: 0; }
+li { margin-bottom: 3pt; }
+table { width: 100%; border-collapse: collapse; margin: 8pt 0 12pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+thead th { background: #f5f1e8; color: #1e3a5f; text-align: left; padding: 5pt 7pt; border-bottom: 1px solid #d4a84b; font-weight: 600; }
+td { padding: 5pt 7pt; border-bottom: 1px solid #eee; vertical-align: top; }
+.eyebrow { text-transform: uppercase; letter-spacing: 0.1em; font-size: 8pt; color: #8a7a4f; margin-bottom: 2pt; }
+.gold-rule { border: none; border-top: 1.5pt solid #d4a84b; width: 68pt; margin: 10pt 0 14pt 0; }
+.cover { margin-bottom: 12pt; }
+.cover .subtitle { font-size: 10.5pt; color: #3c4b66; }
+.chip {
+  display: inline-block;
+  padding: 2pt 7pt;
+  border-radius: 2pt;
+  font-family: "Source Sans 3", "Helvetica", sans-serif;
+  font-size: 8.5pt;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  margin-right: 6pt;
+  margin-top: 2pt;
+  vertical-align: middle;
+}
+.chip.navy { background: #1e3a5f; color: #ffffff; }
+.chip.gold { background: #d4a84b; color: #0b172a; }
+.chip.terracotta { background: #b85c38; color: #ffffff; }
+.score-pill {
+  display: inline-block;
+  padding: 1pt 8pt;
+  border: 1px solid #1e3a5f;
+  border-radius: 2pt;
+  font-family: "Source Sans 3", "Helvetica", sans-serif;
+  font-size: 9pt;
+  color: #1e3a5f;
+  margin-left: 4pt;
+  font-weight: 600;
+}
+.section { page-break-inside: auto; }
+.pbefore { page-break-before: always; }
+.quote-block {
+  margin: 6pt 0 6pt 10pt;
+  padding-left: 10pt;
+  border-left: 2px solid #d4a84b;
+  color: #3c4b66;
+  font-style: italic;
+}
+.two-col {
+  column-count: 2;
+  column-gap: 18pt;
+  font-size: 9.5pt;
+}
+.two-col .d {
+  break-inside: avoid;
+  margin-bottom: 6pt;
+}
+.two-col .d .n { color: #1e3a5f; font-weight: 600; display: block; }
+.two-col .d .c { color: #8a7a4f; font-size: 8pt; text-transform: uppercase; letter-spacing: 0.05em; }
+.calibration {
+  margin: 10pt 0;
+  padding: 10pt 12pt;
+  background: #f5f1e8;
+  border-left: 2pt solid #d4a84b;
+}
+.calibration .bar {
+  position: relative;
+  height: 6pt;
+  background: #e5e0d1;
+  border-radius: 3pt;
+  margin: 8pt 0 4pt 0;
+}
+.calibration .marker {
+  position: absolute;
+  top: -3pt;
+  width: 4pt;
+  height: 12pt;
+  background: #1e3a5f;
+  border-radius: 2pt;
+}
+.calibration .labels { display: flex; justify-content: space-between; font-size: 8pt; color: #3c4b66; }
+.footer-meta { margin-top: 16pt; font-size: 8.5pt; color: #8a7a4f; }
+.kv { margin: 2pt 0; }
+.kv b { color: #1e3a5f; font-weight: 600; }
+.intra-section { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+<header class="cover">
+  <p class="eyebrow">Executive Assessment</p>
+  <h1>{{ cover.title }}</h1>
+  <p class="subtitle">
+    <strong>{{ participant.first_name }}</strong>{% if participant.organisation %} · {{ participant.organisation }}{% endif %}{% if participant.role %} · {{ participant.role }}{% endif %}<br>
+    <em>Completed {{ cover.completed_date }}</em>
+  </p>
+  <hr class="gold-rule">
+</header>
+
+<section class="section">
+  <h2>1. Executive Summary</h2>
+  <p>
+    <span class="chip {{ deliverable.executive_summary.overall_colour or 'gold' }}">{{ deliverable.executive_summary.overall_category }}</span>
+    <span>{{ deliverable.executive_summary.category_statement }}</span>
+  </p>
+  <p>{{ deliverable.executive_summary.prose }}</p>
+
+  <h3>Key Strengths</h3>
+  <ul>
+    {% for s in deliverable.executive_summary.key_strengths %}
+    <li><strong>{{ s.heading }}</strong> — {{ s.evidence }}</li>
+    {% endfor %}
+  </ul>
+
+  <h3>Development Priorities</h3>
+  <ul>
+    {% for d in deliverable.executive_summary.development_priorities %}
+    <li><strong>{{ d.heading }}</strong> — {{ d.evidence }}</li>
+    {% endfor %}
+  </ul>
+
+  <p><em>{{ deliverable.executive_summary.bottom_line }}</em></p>
+</section>
+
+<section class="section">
+  <h2>2. Dimension Profile — Assessed</h2>
+  {% for p in deliverable.dimension_profiles %}
+  <div class="intra-section">
+    <h3>{{ p.name }}
+      <span class="score-pill">{{ "%.1f"|format(p.score) }}</span>
+      <span class="chip {{ p.band.colour }}">{{ p.band.category }}</span>
+      <span style="color:#8a7a4f; font-size:9pt;"> · {{ p.confidence|capitalize }} confidence</span>
+    </h3>
+    <p style="color:#3c4b66;"><em>{{ p.definition }}</em></p>
+    <p>{{ p.observed }}</p>
+    <p><strong>What this means for transformation readiness.</strong> {{ p.transformation_relevance }}</p>
+    {% if p.evidence_quotes %}
+    <div class="quote-block">
+      <strong>Evidence from your responses:</strong>
+      <ul>
+      {% for q in p.evidence_quotes %}
+        <li>"{{ q }}"</li>
+      {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+
+<section class="section">
+  <h2>3. Self-Awareness Insight</h2>
+  <p>{{ deliverable.integration_analysis.self_awareness_accuracy_narrative }}</p>
+  {% if self_awareness.status == "computed" %}
+  <div class="calibration">
+    <div><strong>{{ self_awareness.band }}</strong>
+      <span style="color:#3c4b66;">· Δ = {{ self_awareness.delta }} ({{ self_awareness.direction|replace("_", "-") }})</span>
+    </div>
+    <div class="bar">
+      <div class="marker" style="left: {{ self_awareness.marker_percent }}%;"></div>
+    </div>
+    <div class="labels">
+      <span>Under-claiming</span>
+      <span>Well-calibrated</span>
+      <span>Over-claiming</span>
+    </div>
+    <p style="margin-top: 6pt;">
+      <span class="kv"><b>Claimed:</b> {{ self_awareness.claimed }}</span>
+      &nbsp;·&nbsp;
+      <span class="kv"><b>Observed:</b> {{ self_awareness.observed }}</span>
+    </p>
+  </div>
+  {% else %}
+  <p style="color:#8a7a4f;"><em>Self-awareness calibration could not be computed for this session.</em></p>
+  {% endif %}
+</section>
+
+<section class="section">
+  <h2>4. AI Fluency Deep Dive</h2>
+  <p>{{ deliverable.ai_fluency_deep_dive.overview }}</p>
+  <table>
+    <thead>
+      <tr><th>Component</th><th>Score</th><th>Confidence</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+    {% for row in deliverable.ai_fluency_deep_dive.components_table %}
+      <tr>
+        <td><strong>{{ row.component }}</strong></td>
+        <td>{{ row.score }}/5</td>
+        <td>{{ row.confidence|capitalize }}</td>
+        <td>{{ row.notes }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p><strong>What excellent looks like.</strong> {{ deliverable.ai_fluency_deep_dive.what_excellent_looks_like }}</p>
+  <p><strong>This participant's gap.</strong> {{ deliverable.ai_fluency_deep_dive.participant_gap }}</p>
+  {% if deliverable.ai_fluency_deep_dive.illustrative_quotes %}
+  <div class="quote-block">
+    <strong>Illustrative quotes:</strong>
+    <ul>
+    {% for q in deliverable.ai_fluency_deep_dive.illustrative_quotes %}
+      <li>"{{ q }}"</li>
+    {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</section>
+
+<section class="section">
+  <h2>5. Strategic Decision Profile</h2>
+  {% if strategic.cognitive_flexibility %}
+  <h3>Cognitive Flexibility
+    <span class="score-pill">{{ "%.0f"|format(strategic.cognitive_flexibility.score) }}</span>
+    <span style="color:#8a7a4f; font-size:9pt;"> · {{ strategic.cognitive_flexibility.confidence|capitalize }} confidence</span>
+  </h3>
+  <p><strong>Part 1 position.</strong> {{ strategic.cognitive_flexibility.evidence.part1_position }}</p>
+  <p><strong>Part 2 revision.</strong> {{ strategic.cognitive_flexibility.evidence.part2_revision }}</p>
+  <p><strong>Revision quality.</strong> {{ strategic.cognitive_flexibility.evidence.revision_quality }}</p>
+  <div class="quote-block">"{{ strategic.cognitive_flexibility.evidence.key_quote }}"</div>
+  {% endif %}
+
+  {% if strategic.systems_thinking %}
+  <h3>Systems Thinking
+    <span class="score-pill">{{ "%.0f"|format(strategic.systems_thinking.score) }}</span>
+    <span style="color:#8a7a4f; font-size:9pt;"> · {{ strategic.systems_thinking.confidence|capitalize }} confidence</span>
+  </h3>
+  <table>
+    <thead>
+      <tr><th>Connections identified</th><th>Connections missed</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>
+          <ul>{% for c in strategic.systems_thinking.evidence.connections_identified %}<li>{{ c }}</li>{% endfor %}</ul>
+        </td>
+        <td>
+          <ul>{% for c in strategic.systems_thinking.evidence.connections_missed %}<li>{{ c }}</li>{% endfor %}</ul>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="quote-block">"{{ strategic.systems_thinking.evidence.key_quote }}"</div>
+  {% endif %}
+
+  {% if strategic.additional_observations %}
+  <p><strong>Stakeholder awareness.</strong> {{ strategic.additional_observations.stakeholder_awareness }}</p>
+  <p><strong>Ethical reasoning.</strong> {{ strategic.additional_observations.ethical_reasoning }}</p>
+  <p><strong>Analytical quality.</strong> {{ strategic.additional_observations.analytical_quality }}</p>
+  {% endif %}
+</section>
+
+<section class="section pbefore">
+  <h2>6. Development Recommendations</h2>
+  {% for r in deliverable.development_recommendations %}
+  <div class="intra-section">
+    <h3>{{ loop.index }}. {{ r.title }}</h3>
+    <p class="kv"><b>What:</b> {{ r.what }}</p>
+    <p class="kv"><b>Why:</b> {{ r.why }}</p>
+    <p class="kv"><b>How:</b> {{ r.how }}</p>
+    <p class="kv"><b>Expectation:</b> {{ r.expectation }}</p>
+  </div>
+  {% endfor %}
+</section>
+
+<section class="section">
+  <h2>7. Integration Analysis</h2>
+  <p>{{ deliverable.integration_analysis.patterns }}</p>
+  {% if deliverable.integration_analysis.contradictions %}
+  <p><strong>Contradictions.</strong> {{ deliverable.integration_analysis.contradictions }}</p>
+  {% endif %}
+  <p><strong>Emergent themes.</strong> {{ deliverable.integration_analysis.emergent_themes }}</p>
+</section>
+
+<section class="section">
+  <h2>8. Methodology Note</h2>
+  <p>{{ deliverable.methodology_note }}</p>
+
+  <h3>Not assessed in this preview</h3>
+  <p style="color:#3c4b66;"><em>The full framework covers 16 dimensions. The following ten were not assessed in this demonstration and would be covered in a production assessment.</em></p>
+  <div class="two-col">
+    {% for d in dimensions_not_assessed %}
+    <div class="d">
+      <span class="c">{{ d.cluster }}</span>
+      <span class="n">{{ d.name }}</span>
+      {{ d.definition }}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<footer class="footer-meta">
+  <hr class="gold-rule">
+  <p><strong>Resume code:</strong> {{ resume_code }} · <strong>Assessment date:</strong> {{ cover.completed_date }}</p>
+  <p>This deliverable will be retained for 60 days. All AI-generated assessments undergo expert assessor review before final delivery in production. This report represents AI first-pass analysis for demonstration purposes.</p>
+</footer>
+</body>
+</html>

@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response as FAResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from dotenv import load_dotenv
@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import os
+import asyncio
 import logging
 import uuid
 import secrets
@@ -47,6 +48,9 @@ from services.llm_router import (
 )
 from services import ai_discussion_service as ai_svc
 from services import scenario_service as scn_svc
+from services import synthesis_service as syn_svc
+from services import dimensions_catalogue as dims_catalogue
+from services import results_render
 import psychometric_service
 
 ROOT_DIR = Path(__file__).parent
@@ -1221,6 +1225,266 @@ async def scenario_autosave(payload: ScnAutosaveIn, request: Request):
     logger.debug("Scenario autosave session=%s phase=%s keys=%s",
                  payload.session_id, payload.phase, sorted(partial.keys()))
     return {"saved_at": now}
+
+
+# --------------------------------------------------------------------------- #
+# Routes — Processing / Synthesis / Results (Phase 7)
+# --------------------------------------------------------------------------- #
+SYNTHESIS_STUCK_AFTER_SEC = 120  # restart if in_progress without updates for 2 min
+
+
+class ProcessingStartIn(BaseModel):
+    session_id: str
+
+
+async def _syn_build_tiers() -> List[Tier]:
+    doc = await admin_settings_coll.find_one({"_id": SETTINGS_DOC_ID})
+    return await ai_svc.build_tiers_from_admin_settings(doc)
+
+
+async def _run_synthesis_task(session_id: str) -> None:
+    """Background worker: runs the synthesis LLM call and writes deliverable.
+    Always terminal — sets synthesis.status to 'completed' or 'failed'."""
+    try:
+        doc = await sessions_coll.find_one({"session_id": session_id})
+        if not doc:
+            logger.warning("Synthesis worker: session %s vanished", session_id)
+            return
+        tiers = await _syn_build_tiers()
+        result = await syn_svc.run_synthesis(doc, tiers)
+        now = _now_iso()
+        if result.get("ok"):
+            annotated = syn_svc.annotate_deliverable(result["payload"])
+            completed_at = now
+            expires_at = (datetime.fromisoformat(now) + SIXTY_DAYS).isoformat()
+            update = {
+                "deliverable": annotated,
+                "synthesis.status": "completed",
+                "synthesis.completed_at": now,
+                "synthesis.provider": result.get("provider"),
+                "synthesis.model": result.get("model"),
+                "synthesis.fallbacks_tried": result.get("fallbacks_tried", 0),
+                "stage": "results",
+                "status": "completed",
+                "completed_at": completed_at,
+                "expires_at": expires_at,
+                "updated_at": now,
+            }
+            await sessions_coll.update_one({"session_id": session_id}, {"$set": update})
+            logger.info(
+                "Synthesis completed session=%s provider=%s model=%s fallbacks=%d",
+                session_id, result.get("provider"), result.get("model"),
+                result.get("fallbacks_tried", 0),
+            )
+        else:
+            update = {
+                "deliverable": {
+                    "scoring_error": True,
+                    "_error": result.get("error"),
+                    "_raw": result.get("raw"),
+                },
+                "synthesis.status": "failed",
+                "synthesis.completed_at": now,
+                "synthesis.error": result.get("error"),
+                "updated_at": now,
+            }
+            await sessions_coll.update_one({"session_id": session_id}, {"$set": update})
+            logger.warning("Synthesis failed session=%s error=%s", session_id, result.get("error"))
+    except Exception as exc:  # pragma: no cover — safety net
+        logger.exception("Synthesis worker crashed session=%s: %s", session_id, exc)
+        try:
+            await sessions_coll.update_one(
+                {"session_id": session_id},
+                {"$set": {
+                    "synthesis.status": "failed",
+                    "synthesis.error": f"worker_crashed: {exc}",
+                    "synthesis.completed_at": _now_iso(),
+                    "updated_at": _now_iso(),
+                }},
+            )
+        except Exception:
+            pass
+
+
+def _syn_is_stuck(synthesis: Dict[str, Any]) -> bool:
+    if (synthesis or {}).get("status") != "in_progress":
+        return False
+    started = (synthesis or {}).get("started_at")
+    if not started:
+        return False
+    try:
+        t0 = datetime.fromisoformat(started)
+        delta = (datetime.now(timezone.utc) - t0).total_seconds()
+        return delta > SYNTHESIS_STUCK_AFTER_SEC
+    except Exception:
+        return False
+
+
+@api_router.post("/assessment/processing/start",
+                 summary="Kick off synthesis; returns 202 + poll URL")
+async def processing_start(payload: ProcessingStartIn):
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if doc.get("stage") not in ("processing", "results"):
+        raise HTTPException(status_code=409, detail={
+            "message": "Synthesis cannot start yet. Complete the scenario first.",
+            "current_stage": doc.get("stage"),
+        })
+
+    # Guardrail: required score inputs must be present.
+    scores = doc.get("scores") or {}
+    missing = [k for k in ("psychometric", "ai_fluency", "scenario") if not scores.get(k)]
+    if missing:
+        raise HTTPException(status_code=409, detail={
+            "message": "Synthesis cannot run: missing score blocks.",
+            "missing": missing,
+        })
+
+    synthesis = doc.get("synthesis") or {}
+    status = synthesis.get("status")
+
+    # Already completed → return 200 with same shape
+    if status == "completed":
+        return {
+            "status": "completed",
+            "started_at": synthesis.get("started_at"),
+            "completed_at": synthesis.get("completed_at"),
+            "poll_url": f"/api/assessment/processing/state?session_id={payload.session_id}",
+        }
+
+    # In-progress + fresh → idempotent 202
+    if status == "in_progress" and not _syn_is_stuck(synthesis):
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "in_progress",
+                "started_at": synthesis.get("started_at"),
+                "poll_url": f"/api/assessment/processing/state?session_id={payload.session_id}",
+            },
+        )
+
+    # Start (or restart) the job
+    now = _now_iso()
+    await sessions_coll.update_one(
+        {"session_id": payload.session_id},
+        {"$set": {
+            "stage": "processing",
+            "synthesis.status": "in_progress",
+            "synthesis.started_at": now,
+            "synthesis.completed_at": None,
+            "synthesis.error": None,
+            "updated_at": now,
+        }},
+    )
+    # Fire-and-forget coroutine — survives the response
+    asyncio.create_task(_run_synthesis_task(payload.session_id))
+    logger.info("Synthesis started session=%s", payload.session_id)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "in_progress",
+            "started_at": now,
+            "poll_url": f"/api/assessment/processing/state?session_id={payload.session_id}",
+        },
+    )
+
+
+@api_router.get("/assessment/processing/state",
+                summary="Poll synthesis state (no deliverable body)")
+async def processing_state(session_id: str):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    syn = doc.get("synthesis") or {}
+    return {
+        "status": syn.get("status"),   # "in_progress" | "completed" | "failed" | None
+        "started_at": syn.get("started_at"),
+        "completed_at": syn.get("completed_at"),
+        "error": syn.get("error"),
+    }
+
+
+@api_router.get("/assessment/results",
+                summary="Return the synthesised participant deliverable (gated by synthesis.status)")
+async def get_results(session_id: str):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    syn = doc.get("synthesis") or {}
+    if syn.get("status") != "completed":
+        raise HTTPException(status_code=409, detail={
+            "message": "Synthesis not yet complete.",
+            "synthesis_status": syn.get("status"),
+        })
+    deliverable = doc.get("deliverable") or {}
+    if deliverable.get("scoring_error"):
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "error",
+                "message": "The synthesis could not be produced. An assessor will review your session.",
+                "participant": {
+                    "first_name": (doc.get("participant") or {}).get("name", "").split(" ", 1)[0] or "Participant",
+                },
+                "scoring_error": True,
+            },
+        )
+    self_awareness = syn_svc.compute_self_awareness_accuracy(doc)
+    return {
+        "status": "ok",
+        "participant": {
+            "first_name": (doc.get("participant") or {}).get("name", "").split(" ", 1)[0] or "Participant",
+            "organisation": (doc.get("participant") or {}).get("organisation"),
+            "role": (doc.get("participant") or {}).get("role"),
+        },
+        "completed_at": doc.get("completed_at"),
+        "resume_code": doc.get("resume_code"),
+        "deliverable": deliverable,
+        "self_awareness": self_awareness,
+        "strategic_scenario_scores": (doc.get("scores") or {}).get("scenario"),
+        "dimensions": dims_catalogue.as_public_dicts(),
+    }
+
+
+@api_router.get("/assessment/results/download",
+                summary="Download the deliverable as PDF or Markdown")
+async def download_results(session_id: str, format: Literal["pdf", "markdown"] = "pdf"):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    syn = doc.get("synthesis") or {}
+    if syn.get("status") != "completed":
+        raise HTTPException(status_code=409, detail={
+            "message": "Synthesis not yet complete.",
+            "synthesis_status": syn.get("status"),
+        })
+    deliverable = doc.get("deliverable") or {}
+    if deliverable.get("scoring_error"):
+        raise HTTPException(status_code=409, detail={
+            "message": "The synthesis is not available for download. An assessor will review your session.",
+        })
+
+    self_awareness = syn_svc.compute_self_awareness_accuracy(doc)
+    context = results_render.build_context(doc, deliverable, self_awareness)
+
+    first_name = context["participant"]["first_name"]
+    if format == "pdf":
+        pdf_bytes = results_render.render_pdf(context)
+        filename = results_render.safe_filename(first_name, "pdf")
+        return FAResponse(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    # markdown
+    md_str = results_render.render_markdown(context)
+    filename = results_render.safe_filename(first_name, "md")
+    return FAResponse(
+        content=md_str,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # --------------------------------------------------------------------------- #

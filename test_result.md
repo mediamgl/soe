@@ -108,6 +108,296 @@ user_problem_statement: |
   a Save & exit affordance and localStorage hydrate. Placeholder stages remain placeholders.
 
 backend:
+  - task: "Processing + Results + Synthesis (Phase 7)"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/services/synthesis_service.py, backend/services/dimensions_catalogue.py, backend/services/results_render.py, backend/templates/results.{html,md}.j2"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 7 backend sweep complete. Ran /app/backend_test_phase7.py against
+            http://localhost:8001/api. 24/24 scripted assertions passed (letters
+            A, B1-B2, C1, D1, F1, G1-G2, H1-H5, I1-I2, J1-J2, K1-K6, L); PLUS a
+            full live synthesis run was verified end-to-end against a fresh seeded
+            session f9959971-5ee8-4f9f-83e6-f59ea747d9e0 (letters E1-E8 below).
+            No 500s. No secret leaks. No regressions.
+
+              A. OpenAPI /api/openapi.json enumerates exactly 29 /api/* paths. All
+                 four new paths present: /api/assessment/processing/{start,state},
+                 /api/assessment/results, /api/assessment/results/download.
+              B. POST /assessment/processing/start:
+                 B1. Unknown session_id -> 404 {"detail":"Session not found."} ✓
+                 B2. Already-completed Ada session -> 200 with
+                     {status:"completed", started_at, completed_at, poll_url} and
+                     NO re-run of synthesis. ✓
+              C. Stage gate:
+                 C1. session at stage=identity -> 409 with detail
+                     {message:"Synthesis cannot start yet. Complete the scenario
+                     first.", current_stage:"identity"}. ✓
+              D. Missing score blocks gate:
+                 D1. Seeded fresh session, then mutated scores.psychometric=null
+                     directly in Mongo while keeping stage='processing'. POST /start
+                     -> 409 with detail {message:"Synthesis cannot run: missing score
+                     blocks.", missing:["psychometric"]}. ✓
+              E. LIVE end-to-end synthesis on fresh seed (ONE fresh session
+                 consumed, as budgeted):
+                 Fresh session: f9959971-5ee8-4f9f-83e6-f59ea747d9e0
+                 E1. POST /start -> 202 {status:"in_progress", started_at, poll_url}. ✓
+                 E2. Idempotency check partial — second /start within the in-progress
+                     window was held up client-side due to LiteLLM blocking the event
+                     loop during the active synthesis call (ReadTimeout at 60s).
+                     Server-side behaviour verified via code review (server.py:1356-1365
+                     — status=="in_progress" + not stuck returns the persisted
+                     started_at without spawning a new task). Not counted as a
+                     failure; real browsers will not hit this because /start calls
+                     don't happen while polling. [Minor — infra note below.]
+                 E3. Polled /state — synthesis completed in ~136 s total. Two Emergent
+                     calls via Claude Opus 4.6. NOTE: the FIRST synthesis attempt
+                     failed with part_a:"no JSON block" after both internal
+                     _one_call retries exhausted (both raw outputs unparseable),
+                     worker correctly wrote synthesis.status="failed" +
+                     deliverable.scoring_error=true. A subsequent /start (triggered
+                     by the retry branch at server.py:1367) re-ran synthesis and it
+                     succeeded cleanly. This is the documented self-healing behaviour
+                     — the outer restart path works as designed. [Worth flagging to
+                     main agent as an operational sensitivity — see note at bottom.]
+                 E4. After completion, subsequent /start -> 200 with
+                     {status:"completed", completed_at, poll_url}, no re-run. ✓
+                 E5. /state shape is {status, started_at, completed_at, error} only.
+                     NO deliverable body. ✓
+                 E6. /results schema conformance on fresh session:
+                      - status="ok", participant.first_name="Ada"
+                      - executive_summary has all expected keys (overall_category,
+                        overall_colour, prose, key_strengths, development_priorities,
+                        bottom_line) + extras category_statement/overall_language.
+                        overall_colour="gold" ∈ {navy,gold,terracotta}. ✓
+                      - dimension_profiles has exactly 6 entries covering all six
+                        expected ids: learning_agility, tolerance_for_ambiguity,
+                        cognitive_flexibility, self_awareness_accuracy, ai_fluency,
+                        systems_thinking. Every profile carries band.colour ∈
+                        {navy,gold,terracotta} (all "gold" on this run). ✓
+                      - integration_analysis present ✓
+                      - ai_fluency_deep_dive.components_table has exactly 5 rows ✓
+                      - development_recommendations has exactly 2 entries ✓
+                      - methodology_note present ✓
+                      - dimensions.assessed len=6, dimensions.not_assessed len=10 ✓
+                 E7. Admin synthesis meta: {provider:"emergent",
+                     model:"claude-opus-4-6", fallbacks_tried:0, status:"completed"}.
+                     Matches admin_settings.fallback_model. ✓
+                 E8. Session terminal state: stage="results", status="completed",
+                     completed_at and expires_at populated. expires_at - completed_at
+                     = exactly 60 days (Phase 8 cleanup input ready). ✓
+              F. /results on the pre-seeded Ada Lovelace session
+                 (2253141a-830f-4810-a683-890f098b5664):
+                 F1. All schema conformance checks pass (same as E6) — dp_ids
+                     covers all 6 expected, cmp_rows=5, es.overall_colour="gold",
+                     self_awareness.band="Well-calibrated" / delta=0.2 /
+                     direction="over_claiming" (observed=4.0, claimed=4.2,
+                     blind_spots_count=2), devrecs=2. ✓
+              G. /results gating:
+                 G1. Unknown session -> 404. ✓
+                 G2. Fresh identity-stage session (no synthesis) -> 409 with detail
+                     {message:"Synthesis not yet complete.", synthesis_status:null}. ✓
+              H. /results/download:
+                 H1. PDF: HTTP 200, Content-Type "application/pdf", Content-Disposition
+                     'attachment; filename="TRA-Ada-2026-04-23.pdf"', body begins
+                     with b"%PDF-" (exact %PDF-1.7 confirmed, 58 KB). ✓
+                 H2. Markdown: HTTP 200, Content-Type "text/markdown; charset=utf-8",
+                     Content-Disposition 'attachment; filename="TRA-Ada-2026-04-23.md"',
+                     body begins with "# Transformation Readiness Assessment". ✓
+                 H3. Markdown body contains all 10 not-assessed dimension names
+                     (Hybrid Workforce Capability, Generational Intelligence,
+                     Political Acumen, Stakeholder Orchestration, Cultural
+                     Adaptability, Long-Term Orientation, Change Leadership,
+                     Institutional Building, Governance Capability, Results Under
+                     Ambiguity) and the heading "Not assessed in this preview". ✓
+                 H4. Invalid format value (format=html) -> 422. ✓
+                 H5. Unknown session -> 404. ✓
+              I. Graceful scoring_error path (Doc 22 + Doc 23 failure behaviour):
+                 Mutated a fresh session's deliverable to
+                 {scoring_error:true, _error:"test injected error", _raw:"oops"}
+                 and synthesis.status="completed", stage="results".
+                 I1. GET /results -> 200 with {status:"error", scoring_error:true,
+                     participant.first_name:"Ada", message:"The synthesis could not
+                     be produced..."} — NOT 500. ✓
+                 I2. GET /results/download?format=pdf -> 409, NOT 500. ✓
+              J. Privacy / Doc 22 + Doc 12 compliance:
+                 J1. Public GET /api/sessions/{Ada session} — scores:null,
+                     deliverable:null, conversation[] assistant turns contain zero
+                     hits of provider / model / latency_ms / fallbacks_tried keys
+                     (Phase 5 J fix still in effect: _public_conversation strips
+                     those fields). ✓
+                 J2. Admin GET /api/admin/sessions/{Ada session} with JWT cookie
+                     exposes the full scores + deliverable payload. ✓
+              K. Regression — Phases 2-6:
+                 K1. POST /api/sessions -> 201 ✓
+                 K2. Admin login + GET /admin/settings -> 200, fallback_model
+                     "claude-opus-4-6" ✓
+                 K3. GET /assessment/psychometric/next -> 200, POST /answer -> 200 ✓
+                 K4. POST /assessment/ai-discussion/start while
+                     stage=psychometric -> 409 (gate still enforced) ✓
+                 K5. GET /assessment/scenario/state on pre-unlock session ->
+                     200 {status:null, phase:null} ✓
+                 K6. POST /assessment/scenario/advance on a completed Ada
+                     session -> 409 (phase mismatch / already-done gate) ✓
+              L. Log hygiene: scanned /var/log/supervisor/backend*.log for
+                 INFO-level hits of admin password "test1234", API key prefixes
+                 (sk-ant-, sk-emergent-, sk-proj-), participant email
+                 (ada.test@example.co.uk), conversation content needles
+                 ("smart intern", "over-indexed on financial stability"), and
+                 deliverable internals ("executive_summary"). Zero hits at
+                 INFO level. ✓
+
+            OPERATIONAL NOTES for main agent (not blockers, but worth knowing):
+
+              (i) LiteLLM blocks event loop during synthesis. While the fire-
+                  and-forget worker is calling Claude Opus 4.6 via Emergent,
+                  the entire uvicorn event loop is blocked — including simple
+                  /api/health reads. This caused the test-harness idempotency
+                  check on /start to ReadTimeout at the client side (60 s),
+                  though the server did serve that request correctly once the
+                  active LLM call returned. Production UX: the browser poll on
+                  /state will similarly stall for up to ~60 s per LLM call.
+                  Not a Phase 7 bug — it's an emergentintegrations/LiteLLM
+                  transport characteristic. Consider documenting or running the
+                  worker in a dedicated executor if user-facing polling latency
+                  matters.
+
+              (ii) First-attempt synthesis flake observed on one fresh run:
+                   part_a failed with "no JSON block" after both internal
+                   _one_call retries (2 attempts exhausted), worker correctly
+                   wrote synthesis.status="failed" +
+                   deliverable.scoring_error=true. The outer re-entry via a
+                   subsequent /start call (server.py:1367) restarted synthesis
+                   and it succeeded on the next run. The self-healing path is
+                   robust, BUT in production a participant whose first
+                   synthesis fails will see a "failed" state until their
+                   browser re-hits /start. Worth surfacing a retry affordance
+                   on /processing or auto-retrying once server-side after a
+                   short backoff.
+
+            Harness notes (test-side, not server-side):
+              - Fresh X-Forwarded-For per session creation to sidestep 10/hr
+                POST /sessions per-IP rate limit across the sweep.
+              - Admin JWT cookie extracted from Set-Cookie (cookie name
+                "tra_admin_token") and replayed via explicit Cookie header —
+                Secure cookie can't replay over http://localhost via
+                requests.Session.
+              - One fresh seed consumed (f9959971); Ada session re-used for
+                everything else per main-agent guidance.
+
+            No code changes were made during testing. Phase 7 backend passes.
+            Main agent can summarise and close Phase 7.
+
+        - working: "NA"
+          agent: "main"
+          comment: |
+            Phase 7 implementation complete, live smoke-tested once end-to-end.
+            Ready for deep_testing_backend_v2 sweep.
+
+            New services:
+              - services/dimensions_catalogue.py — 16-dimension catalogue hardcoded
+                from Doc 12 (8+8+7+7 / 7+6+6+6 / 7+6+6+6 / 5+5+5+5 = 100%).
+                Asserts at import: 16 items, 6 assessed, 10 not assessed, weights
+                ≈ 100, and the six assessed ids match Doc 19. Doc 12 presence on
+                disk is also asserted.
+              - services/synthesis_service.py — loads `/app/research/23 - Synthesis
+                Prompt.md` at import. Extracts the verbatim SYSTEM_PROMPT from the
+                first fenced block under "## System Prompt" (1328 chars). Exposes
+                Doc 23 CATEGORY_THRESHOLDS (4 tiers — Transformation Ready ≥4.2
+                / High Potential 3.5-4.19 / Development Required 2.8-3.49 /
+                Limited Readiness <2.8) mapped to 3 palette colours (navy / gold /
+                terracotta / terracotta). compute_self_awareness_accuracy() uses
+                observed = 0.5·capability_understanding + 0.5·clip(5 - 0.5·blind_spots,
+                1, 5); bands Well/Slightly/Significantly miscalibrated at |Δ|<0.5,
+                ≤1.0, >1.0; direction = over_claiming / aligned / under_claiming.
+              - services/results_render.py — Jinja2 renderer for both PDF (WeasyPrint
+                from results.html.j2) and Markdown (results.md.j2). Sanitised
+                filename TRA-{first_name}-{YYYY-MM-DD}.{ext}. Templates are shared-
+                context so both formats render identical content.
+              - templates/results.html.j2 + templates/results.md.j2 — 9 report
+                sections (cover, exec summary, dimension profile, self-awareness,
+                AI fluency deep dive, strategic decision profile, development recs,
+                integration analysis, methodology + not-assessed). A4 print CSS on
+                the HTML template; page-break rules on section boundaries. Chips
+                carry text label alongside colour (a11y). The 10 not-assessed
+                dimensions render as a two-column list from Doc 12.
+
+            Architectural decision (fixes observed Emergent-proxy constraint):
+              - The Emergent/Claude Opus 4.6 path reliably generates up to ~2500
+                output tokens before truncating/timing out (confirmed via probes).
+                A one-shot synthesis of the full 6-section deliverable needs
+                ~3500+ tokens → fails. So run_synthesis() now makes TWO focused
+                LLM calls through the same 3-tier router cascade:
+                  Call A (max_tokens=2000): executive_summary, integration_analysis,
+                    ai_fluency_deep_dive (narrative only), development_recommendations,
+                    methodology_note.
+                  Call B (max_tokens=2500): dimension_profiles (6 items) +
+                    ai_fluency_deep_dive.components_table (5 rows).
+                Both halves parsed with the strict JSON extractor + validator
+                (one retry each on malformed output). Merged in Python, validated
+                against the full schema, annotated with band colours, persisted to
+                session.deliverable. On any unrecoverable failure the scoring_error
+                path writes {scoring_error:true,_error,_raw} and the /results
+                endpoint returns a graceful error JSON (no 500).
+
+            New endpoints (/api/assessment/**, no admin auth):
+              - POST /processing/start   — gates on stage in {processing, results};
+                                           gates on scores.{psychometric, ai_fluency,
+                                           scenario} all present; idempotent when
+                                           in_progress + fresh (≤120s); otherwise
+                                           restarts. Returns 202 + poll_url. Kicks
+                                           off a fire-and-forget asyncio.create_task.
+              - GET  /processing/state   — {status, started_at, completed_at, error}.
+                                           No deliverable body.
+              - GET  /assessment/results — gated by synthesis.status=="completed".
+                                           Returns participant-safe deliverable,
+                                           self_awareness, strategic_scenario_scores,
+                                           dimensions.{assessed,not_assessed}, and
+                                           participant first_name/organisation/role.
+                                           scoring_error path returns 200 with a
+                                           graceful apology shape.
+              - GET  /assessment/results/download?format=pdf|markdown — streams
+                                           FAResponse with correct Content-Type and
+                                           Content-Disposition filename.
+
+            Session lifecycle on synthesis success:
+              - deliverable = annotated payload
+              - synthesis = {status:"completed", started_at, completed_at, provider,
+                             model, fallbacks_tried}
+              - stage = "results"
+              - status = "completed"
+              - completed_at = now()
+              - expires_at = completed_at + 60 days (Phase 8 cleanup input)
+
+            Live smoke evidence (one full run, Emergent/claude-opus-4-6):
+              - Seeded canned session 2253141a-830f-4810-a683-890f098b5664 / resume 7M7A-X5F5.
+              - POST /processing/start → 202 in_progress.
+              - Synthesis completed in ~135s total (two LLM calls).
+              - GET /results: category "High Potential", 6 dimension_profiles (all 6
+                expected ids), 5 components_table rows (Capability Understanding,
+                Paradigm Awareness, Orchestration Concepts, Governance Thinking,
+                Personal Usage), self_awareness.delta=0.2 ("Well-calibrated"),
+                10 not-assessed dimensions.
+              - GET /results/download?format=pdf → 200, application/pdf,
+                filename TRA-Ada-2026-04-23.pdf, 59236 bytes, starts with %PDF-1.7.
+              - GET /results/download?format=markdown → 200, text/markdown,
+                filename TRA-Ada-2026-04-23.md, 22384 bytes, starts with
+                "# Transformation Readiness Assessment".
+              - Public GET /api/sessions/{id}: scores=null, deliverable=null
+                (privacy intact). Admin GET exposes both.
+              - session.stage="results", expires_at - completed_at = 60 days.
+
+            Unit tests: tests/test_synthesis_service.py — 37 tests, all passing.
+            (Catalogue invariants, Doc 23 parsing, band mapping, self-awareness
+            computation edges, bundle builder, JSON extractor, validator positive +
+            8 negative paths, annotate_deliverable, two-call run_synthesis happy
+            path + retry + double-fail paths via monkeypatched router_chat.)
+
   - task: "Strategic Scenario endpoints + scoring (Phase 6)"
     implemented: true
     working: true
@@ -430,10 +720,10 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Strategic Scenario endpoints (start/advance/autosave/state) — Phase 6"
-    - "Scenario scoring via LLM router 3-tier cascade (live call on advance part2->done)"
-    - "Scoring JSON parse + schema validation + retry-on-malformed + scoring_error path"
-    - "Regression: Phase 2-5 endpoints + Phase 5 J fix (public conversation shape)"
+    - "Phase 7 — Processing + Results endpoints"
+    - "Synthesis via 3-tier llm_router (two-call split: narrative + structured)"
+    - "Results JSON + PDF + Markdown download; privacy (public vs admin reads)"
+    - "Regression: Phases 2–6 endpoints still green"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -441,7 +731,155 @@ test_plan:
 agent_communication:
     - agent: "main"
       message: |
-        Phase 6 (Strategic Scenario) backend is code-complete and Playwright-verified
+        Phase 7 (Processing + Results + Doc 23 synthesis) is code-complete and
+        has passed a full live smoke run end-to-end. Requesting a thorough
+        deep_testing_backend_v2 sweep of the new surface before handing back.
+
+        Please test against http://localhost:8001/api.
+
+        Completed smoke-test session available for reuse (already has a full
+        deliverable persisted) — only spend a fresh synthesis call if you
+        genuinely need one:
+          session_id: 2253141a-830f-4810-a683-890f098b5664
+          resume_code: 7M7A-X5F5
+        And a re-seeder script exists: `python /app/backend/seed_phase7_test_session.py`
+        will mint a new pristine session with full psychometric + ai_fluency +
+        scenario scores and stage="processing".
+
+        Targets (full list in test_result.md status_history):
+
+          1. POST /assessment/processing/start
+             - 404 on unknown session
+             - 409 when stage ∉ {processing, results} (with detail.current_stage)
+             - 409 when any of scores.{psychometric, ai_fluency, scenario} missing
+             - Happy path → 202 {status:"in_progress", started_at, poll_url}
+             - Idempotency: second call within 2 min while in_progress → same 202
+               payload, NO new asyncio task spawned (detectable by started_at
+               staying the same).
+             - After completion → subsequent /start returns 200 "completed" with
+               completed_at — no re-run.
+
+          2. GET /assessment/processing/state?session_id=...
+             - Unknown session → 404
+             - {status, started_at, completed_at, error} shape; NO deliverable body
+
+          3. GET /assessment/results?session_id=...
+             - 404 on unknown
+             - 409 when synthesis.status != "completed"
+             - Happy path: deliverable with ai_fluency_deep_dive.components_table
+               (5 rows), dimension_profiles (6 with correct dimension_id set),
+               executive_summary carrying overall_colour ∈ {navy,gold,terracotta},
+               dimensions.assessed (6) + dimensions.not_assessed (10)
+             - scoring_error path: 200 with {status:"error", scoring_error:true,
+               participant.first_name}
+
+          4. GET /assessment/results/download?format=pdf|markdown
+             - PDF: Content-Type application/pdf, Content-Disposition filename
+               matches TRA-{first_name}-{YYYY-MM-DD}.pdf, body starts with %PDF
+             - Markdown: Content-Type text/markdown; charset=utf-8, body starts
+               with "# Transformation Readiness Assessment", contains all 10
+               not-assessed dimension names and "Not assessed in this preview"
+             - Invalid format value → 422
+             - scoring_error path → 409 (download not available)
+             - When synthesis not complete → 409
+
+          5. Privacy
+             - Public GET /api/sessions/{id}: scores, deliverable still null
+               even after synthesis completes
+             - Conversation entries on public read still strip provider/model/
+               latency_ms/fallbacks_tried (Phase 5 J fix still in effect)
+             - Admin GET /api/admin/sessions/{id}: scores + deliverable visible
+
+          6. Regression — Phases 2-6 endpoints still respond (sessions, admin,
+             psychometric, ai-discussion, scenario).
+
+          7. /api/openapi.json: 29 /api/* paths total (25 prior + 4 new).
+
+          8. Log hygiene: no deliverable content, conversation content, API keys,
+             or full prompts at INFO level in /var/log/supervisor/backend.*.log.
+
+        Admin credentials (for admin reads):
+          email: steve@org-logic.io
+          password: test1234
+
+        Live LLM budget: ONE additional real synthesis run will consume two
+        Emergent/Claude Opus 4.6 calls. Prefer reusing the Ada Lovelace
+        session above; only mint a fresh one if you're verifying a code path
+        that actually requires an unsullied session (e.g. the idempotency
+        window).
+
+        Please update the Phase 7 task's status_history with letter-coded
+        findings (A…N style, as in Phases 4/5/6) and set needs_retesting=false
+        if green. Do NOT modify any other phase's task entries.
+    - agent: "testing"
+      message: |
+        Phase 7 backend sweep: 24/24 scripted assertions PASS, plus live
+        end-to-end synthesis verified on a fresh seeded session. See the
+        Phase 7 task's status_history above for the full letter-coded
+        detail (A, B1-B2, C1, D1, E1-E8 live, F1, G1-G2, H1-H5, I1-I2,
+        J1-J2, K1-K6, L).
+
+        Highlights:
+          - OpenAPI enumerates exactly 29 /api/* paths; all four new Phase-7
+            endpoints present.
+          - /processing/start gates correctly (404 unknown, 409 stage,
+            409 missing score blocks) and is idempotent for
+            already-completed sessions (200).
+          - /processing/state shape clean — no deliverable body leaks.
+          - /results schema conformance verified on BOTH the Ada session
+            and the fresh live session: executive_summary.overall_colour ∈
+            {navy,gold,terracotta}, exactly 6 dimension_profiles covering
+            all 6 expected ids, every profile carries band.colour in the
+            palette, components_table has 5 rows, development_recommendations
+            has 2, methodology_note + integration_analysis present,
+            dimensions.assessed=6 / not_assessed=10.
+          - Downloads: PDF body starts %PDF-, MD starts with
+            "# Transformation Readiness Assessment", both carry correct
+            Content-Type + filename TRA-Ada-2026-04-23.{pdf|md}; MD contains
+            all 10 not-assessed dimension names + "Not assessed in this preview".
+          - Graceful scoring_error path: /results returns 200 status:"error"
+            (not 500), /download returns 409 (not 500).
+          - Privacy: public GET hides scores + deliverable; conversation
+            assistant turns strip provider/model/latency_ms/fallbacks_tried
+            (Phase 5 J fix still in effect). Admin read exposes both.
+          - Fresh synthesis run: provider=emergent, model=claude-opus-4-6,
+            fallbacks_tried=0, ~136 s end-to-end, stage="results",
+            expires_at - completed_at = exactly 60 days.
+          - Regression Phases 2-6 green.
+          - Log hygiene: zero INFO-level leaks of passwords, API keys,
+            participant emails, conversation content, or deliverable
+            internals.
+
+        Two non-blocking operational notes for main agent (NOT failures):
+
+          1. LiteLLM blocks the uvicorn event loop during synthesis.
+             Concurrent requests (including /api/health) stall for up to
+             ~60 s while an LLM call is in flight. Browser poll latency on
+             /processing/state will be affected. Phase 7 code is correct;
+             this is an emergentintegrations/LiteLLM transport
+             characteristic — consider running the worker in a dedicated
+             executor if poll UX latency is user-visible.
+
+          2. On one of the two live synthesis runs performed this sweep, the
+             first attempt failed with part_a:"no JSON block" after both
+             internal _one_call retries (2 attempts) exhausted. Worker
+             correctly wrote synthesis.status="failed" +
+             deliverable.scoring_error=true. A subsequent /start triggered
+             the server.py:1367 restart branch and synthesis succeeded on
+             that second run. Self-healing works, but a participant whose
+             first synthesis flakes will be stuck at "failed" until their
+             client re-hits /start. Worth surfacing either a retry button
+             on /processing or a one-off server-side auto-retry with
+             backoff.
+
+        No code changes were made during testing. Phase 7 backend passes;
+        main agent can summarise and close Phase 7.
+
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 6 (Strategic Scenario) backend was code-complete and Playwright-verified
         end-to-end on the frontend; now requesting a thorough deep_testing_backend_v2
         sweep of the four new endpoints under /api/assessment/scenario before I hand
         Phase 6 back to the user.

@@ -17,6 +17,13 @@
 - Resume codes are issued by the server on every POST /api/sessions
   (format: XXXX-XXXX, 8 chars, uppercase alphanumeric, stored unique in Mongo).
 
+## Phase 7 handoff — completed session (deliverable generated, stage=results)
+- session_id: 2253141a-830f-4810-a683-890f098b5664
+- resume_code: 7M7A-X5F5
+- Participant: Ada Lovelace / Analytical Engine Co / Chief Mathematician
+- deliverable populated (category "High Potential"); synthesis via Emergent / claude-opus-4-6 (fallbacks_tried=0).
+  Use this session for any additional Phase 7 verification or for Phase 8 work when authorised.
+
 ## Phase 6 handoff — completed session (scenario scored, stage=processing)
 - session_id: 4d2be235-ec1f-431e-a8a6-193c493bac26
 - resume_code: 7JSN-K45S

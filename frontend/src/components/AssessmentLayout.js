@@ -39,10 +39,16 @@ export default function AssessmentLayout() {
     );
   }
 
+  // Hide Save & exit on the terminal-screen paths — synthesis is running
+  // server-side (nothing to save), and results is the final screen.
+  const showSaveExit = !(
+    pathname.endsWith("/assessment/processing") || pathname.endsWith("/assessment/results")
+  );
+
   return (
     <div className="max-w-content mx-auto px-6 sm:px-8 pt-8 sm:pt-10 pb-8">
-      <div className="flex items-center justify-end mb-4 sm:mb-6">
-        <SaveExitButton />
+      <div className="flex items-center justify-end mb-4 sm:mb-6 h-6">
+        {showSaveExit && <SaveExitButton />}
       </div>
       <ProgressStepper />
       <div className="mt-12 sm:mt-16">

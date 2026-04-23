@@ -1,0 +1,159 @@
+# {{ cover.title }}
+
+**{{ participant.first_name }}{% if participant.organisation %} · {{ participant.organisation }}{% endif %}{% if participant.role %} · {{ participant.role }}{% endif %}**
+*Completed {{ cover.completed_date }}*
+
+---
+
+## 1. Executive Summary
+
+**Overall:** {{ deliverable.executive_summary.overall_category }} — {{ deliverable.executive_summary.category_statement }}
+
+{{ deliverable.executive_summary.prose }}
+
+**Key strengths:**
+{% for s in deliverable.executive_summary.key_strengths %}- **{{ s.heading }}** — {{ s.evidence }}
+{% endfor %}
+
+**Development priorities:**
+{% for d in deliverable.executive_summary.development_priorities %}- **{{ d.heading }}** — {{ d.evidence }}
+{% endfor %}
+
+*{{ deliverable.executive_summary.bottom_line }}*
+
+---
+
+## 2. Dimension Profile — Assessed
+
+{% for p in deliverable.dimension_profiles %}
+### {{ p.name }} — {{ "%.1f"|format(p.score) }} ({{ p.confidence|capitalize }} confidence)
+
+*{{ p.band.category }} · {{ p.band.language }}*
+
+{{ p.definition }}
+
+{{ p.observed }}
+
+{{ p.transformation_relevance }}
+
+**Evidence from your responses:**
+{% for q in p.evidence_quotes %}- *"{{ q }}"*
+{% endfor %}
+
+{% endfor %}
+
+---
+
+## 3. Self-Awareness Insight
+
+{{ deliverable.integration_analysis.self_awareness_accuracy_narrative }}
+
+{% if self_awareness.status == "computed" %}
+**Calibration:** {{ self_awareness.band }} (Δ = {{ self_awareness.delta }}; {{ self_awareness.direction|replace("_", "-") }})
+Claimed self-awareness score: {{ self_awareness.claimed }} · Observed: {{ self_awareness.observed }}
+{% else %}
+*Self-awareness calibration could not be computed for this session.*
+{% endif %}
+
+---
+
+## 4. AI Fluency Deep Dive
+
+{{ deliverable.ai_fluency_deep_dive.overview }}
+
+| Component | Score | Confidence | Notes |
+|-----------|-------|------------|-------|
+{% for row in deliverable.ai_fluency_deep_dive.components_table %}| {{ row.component }} | {{ row.score }} | {{ row.confidence|capitalize }} | {{ row.notes }} |
+{% endfor %}
+
+**What excellent looks like:** {{ deliverable.ai_fluency_deep_dive.what_excellent_looks_like }}
+
+**This participant's gap:** {{ deliverable.ai_fluency_deep_dive.participant_gap }}
+
+{% if deliverable.ai_fluency_deep_dive.illustrative_quotes %}**Illustrative quotes:**
+{% for q in deliverable.ai_fluency_deep_dive.illustrative_quotes %}- *"{{ q }}"*
+{% endfor %}
+{% endif %}
+
+---
+
+## 5. Strategic Decision Profile
+
+{% if strategic.cognitive_flexibility %}
+### Cognitive Flexibility — {{ strategic.cognitive_flexibility.score }} ({{ strategic.cognitive_flexibility.confidence|capitalize }} confidence)
+
+{{ strategic.cognitive_flexibility.observed }}
+
+*Part 1 position:* {{ strategic.cognitive_flexibility.evidence.part1_position }}
+*Part 2 revision:* {{ strategic.cognitive_flexibility.evidence.part2_revision }}
+*Revision quality:* {{ strategic.cognitive_flexibility.evidence.revision_quality }}
+*Key quote:* "{{ strategic.cognitive_flexibility.evidence.key_quote }}"
+{% endif %}
+
+{% if strategic.systems_thinking %}
+### Systems Thinking — {{ strategic.systems_thinking.score }} ({{ strategic.systems_thinking.confidence|capitalize }} confidence)
+
+{{ strategic.systems_thinking.observed }}
+
+**Connections identified:**
+{% for c in strategic.systems_thinking.evidence.connections_identified %}- {{ c }}
+{% endfor %}
+
+**Connections missed:**
+{% for c in strategic.systems_thinking.evidence.connections_missed %}- {{ c }}
+{% endfor %}
+
+*Key quote:* "{{ strategic.systems_thinking.evidence.key_quote }}"
+{% endif %}
+
+{% if strategic.additional_observations %}
+**Stakeholder awareness.** {{ strategic.additional_observations.stakeholder_awareness }}
+**Ethical reasoning.** {{ strategic.additional_observations.ethical_reasoning }}
+**Analytical quality.** {{ strategic.additional_observations.analytical_quality }}
+{% endif %}
+
+---
+
+## 6. Development Recommendations
+
+{% for r in deliverable.development_recommendations %}
+### {{ loop.index }}. {{ r.title }}
+
+- **What:** {{ r.what }}
+- **Why:** {{ r.why }}
+- **How:** {{ r.how }}
+- **Expectation:** {{ r.expectation }}
+
+{% endfor %}
+
+---
+
+## 7. Integration Analysis
+
+{{ deliverable.integration_analysis.patterns }}
+
+{% if deliverable.integration_analysis.contradictions %}**Contradictions:** {{ deliverable.integration_analysis.contradictions }}
+
+{% endif %}**Emergent themes:** {{ deliverable.integration_analysis.emergent_themes }}
+
+---
+
+## 8. Methodology Note
+
+{{ deliverable.methodology_note }}
+
+### Not assessed in this preview
+
+The full framework covers 16 dimensions. The following ten were not assessed in this demonstration and would be covered in a production assessment:
+
+{% for d in dimensions_not_assessed %}- **{{ d.name }}** ({{ d.cluster }}) — {{ d.definition }}
+{% endfor %}
+
+---
+
+## 9. Session details
+
+- **Resume code:** {{ resume_code }}
+- **Assessment date:** {{ cover.completed_date }}
+- **Retention:** This deliverable will be retained for 60 days.
+- **Production note:** All AI-generated assessments undergo expert assessor review before final delivery in production. This report represents AI first-pass analysis for demonstration purposes.

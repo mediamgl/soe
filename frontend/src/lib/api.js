@@ -41,6 +41,25 @@ export async function scnAdvance(sessionId, fromPhase, toPhase, payload) {
 }
 export async function scnAutosave(sessionId, phase, partial) { const { data } = await client.post(`/assessment/scenario/autosave`, { session_id: sessionId, phase, partial }); return data; }
 
+// --- Processing / Results (Phase 7) ---------------------------------- //
+export async function processingStart(sessionId) {
+  const { data } = await client.post(`/assessment/processing/start`, { session_id: sessionId });
+  return data;
+}
+export async function processingState(sessionId) {
+  const { data } = await client.get(`/assessment/processing/state`, { params: { session_id: sessionId } });
+  return data;
+}
+export async function getResults(sessionId) {
+  const { data } = await client.get(`/assessment/results`, { params: { session_id: sessionId } });
+  return data;
+}
+export function resultsDownloadUrl(sessionId, fmt /* 'pdf' | 'markdown' */) {
+  const base = `${API_BASE}/assessment/results/download`;
+  const params = new URLSearchParams({ session_id: sessionId, format: fmt });
+  return `${base}?${params.toString()}`;
+}
+
 export function apiErrorMessage(err, fallback = 'Something went wrong.') {
   const resp = err && err.response;
   if (!resp) return err && err.message ? err.message : fallback;
