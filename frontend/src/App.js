@@ -14,6 +14,8 @@ import AdminLayout from './pages/admin/AdminLayout';
 import AdminLogin from './pages/admin/AdminLogin';
 import AdminIndex from './pages/admin/AdminIndex';
 import AdminSettings from './pages/admin/AdminSettings';
+import AdminSessions from './pages/admin/AdminSessions';
+import AdminSessionDetail from './pages/admin/AdminSessionDetail';
 
 function App() {
   return (
@@ -38,6 +40,8 @@ function App() {
         <Route path="/admin" element={<AdminLayout />}>
           <Route index element={<AdminIndex />} />
           <Route path="settings" element={<AdminSettings />} />
+          <Route path="sessions" element={<AdminSessions />} />
+          <Route path="sessions/:sessionId" element={<AdminSessionDetail />} />
         </Route>
       </Routes>
     </BrowserRouter>

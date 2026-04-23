@@ -15,6 +15,11 @@ module.exports = {
           light: '#e0bc68',
           dark: '#b8902f',
         },
+        terracotta: {
+          DEFAULT: '#b85c38',
+          light: '#cc7857',
+          dark: '#8f4527',
+        },
         ink: '#111827',
         muted: '#6b7280',
         hairline: '#e5e7eb',

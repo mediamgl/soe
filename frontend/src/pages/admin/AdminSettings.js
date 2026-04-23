@@ -348,6 +348,49 @@ export default function AdminSettings() {
           )}
         </div>
       </div>
+
+      <LifecyclePanel />
     </section>
+  );
+}
+
+function LifecyclePanel() {
+  const [running, setRunning] = React.useState(false);
+  const [result, setResult] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  async function onRun() {
+    setRunning(true); setError(null); setResult(null);
+    try {
+      const { runLifecycle } = await import('../../lib/adminApi');
+      const r = await runLifecycle();
+      setResult(r);
+    } catch (e) {
+      setError(e?.response?.data?.detail || e?.message || 'Run failed');
+    } finally { setRunning(false); }
+  }
+  return (
+    <div className="card card-gold-top mt-8">
+      <h2 className="font-serif text-2xl text-navy">Lifecycle</h2>
+      <p className="mt-2 text-sm text-ink/75 leading-relaxed">
+        Sessions are <strong className="text-navy">soft-deleted 60 days</strong> after completion
+        (PII scrubbed; scores &amp; transcripts preserved) and then <strong className="text-navy">hard-deleted 30 days</strong> later,
+        unless marked <em>Archived</em>. Soft-deleted sessions can be restored within the 30-day grace window
+        (PII is not recoverable).
+      </p>
+      <p className="mt-2 text-xs uppercase tracking-wider2 text-muted">Automatic cleanup cron runs every 6 hours.</p>
+      <div className="mt-5 flex items-center gap-3 flex-wrap">
+        <button type="button" onClick={onRun} disabled={running} className="btn-primary disabled:opacity-60">
+          {running ? 'Running…' : 'Run cleanup now'}
+        </button>
+        {result && (
+          <div className={'text-xs border px-3 py-2 ' + (result.skipped ? 'border-gold/50 bg-gold/10 text-navy' : 'border-navy/30 bg-mist text-navy')}>
+            {result.skipped
+              ? <>Skipped — last ran {result.last_run_at ? new Date(result.last_run_at).toLocaleString() : 'recently'}.</>
+              : <>Soft-deleted <strong>{result.soft_deleted}</strong> · Hard-deleted <strong>{result.hard_deleted}</strong> · Errors {result.errors}</>}
+          </div>
+        )}
+        {error && <p className="text-xs text-terracotta">{typeof error === 'string' ? error : JSON.stringify(error)}</p>}
+      </div>
+    </div>
   );
 }

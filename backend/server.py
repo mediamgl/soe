@@ -13,6 +13,7 @@ from pathlib import Path
 import os
 import asyncio
 import logging
+import re
 import uuid
 import secrets
 import string
@@ -51,6 +52,9 @@ from services import scenario_service as scn_svc
 from services import synthesis_service as syn_svc
 from services import dimensions_catalogue as dims_catalogue
 from services import results_render
+from services import lifecycle_service as lifecycle
+from services import conversation_export
+from services import dashboard_summary as dashboard
 import psychometric_service
 
 ROOT_DIR = Path(__file__).parent
@@ -1757,12 +1761,281 @@ async def test_fallback(current=Depends(require_admin)):
 # --------------------------------------------------------------------------- #
 # Routes — admin sessions (read only, Phase 4)
 # --------------------------------------------------------------------------- #
+@admin_router.get("/sessions", summary="List sessions (admin, search + filter + pagination)")
+async def admin_list_sessions(
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    include_deleted: bool = True,
+    archived: Optional[str] = None,  # "only" | "exclude" | None
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 25,
+    sort: str = "-created_at",
+    current=Depends(require_admin),
+):
+    page = max(1, int(page))
+    page_size = max(1, min(100, int(page_size)))
+    query: Dict[str, Any] = {}
+
+    # --- status filter (comma-separated whitelist)
+    if status:
+        status_list = [s.strip() for s in status.split(",") if s.strip()]
+        if status_list:
+            query["status"] = {"$in": status_list}
+
+    # --- deleted toggle
+    if not include_deleted:
+        query["deleted_at"] = {"$in": [None]}
+
+    # --- archived toggle
+    if archived == "only":
+        query["archived"] = True
+    elif archived == "exclude":
+        query["archived"] = {"$ne": True}
+
+    # --- date range on created_at
+    if date_from or date_to:
+        date_clause: Dict[str, str] = {}
+        if date_from:
+            date_clause["$gte"] = date_from
+        if date_to:
+            date_clause["$lte"] = date_to
+        query["created_at"] = date_clause
+
+    # --- search — substring over name/email/organisation
+    if q:
+        qs = q.strip()
+        if qs:
+            escaped = re.escape(qs)
+            query["$or"] = [
+                {"participant.name": {"$regex": escaped, "$options": "i"}},
+                {"participant.email": {"$regex": escaped, "$options": "i"}},
+                {"participant.organisation": {"$regex": escaped, "$options": "i"}},
+                {"session_id": {"$regex": escaped, "$options": "i"}},
+            ]
+
+    # --- sort parse
+    if sort.startswith("-"):
+        sort_field, direction = sort[1:], -1
+    else:
+        sort_field, direction = sort, 1
+    allowed_sort = {"created_at", "completed_at", "participant.name", "status", "stage"}
+    if sort_field not in allowed_sort:
+        sort_field = "created_at"
+
+    total = await sessions_coll.count_documents(query)
+    skip = (page - 1) * page_size
+    cursor = sessions_coll.find(query, {
+        "_id": 0,
+        "session_id": 1, "participant": 1, "stage": 1, "status": 1,
+        "created_at": 1, "started_at": 1, "completed_at": 1,
+        "archived": 1, "deleted_at": 1, "hard_delete_at": 1, "redacted": 1,
+        "synthesis": 1,
+        "deliverable.executive_summary.overall_category": 1,
+        "deliverable.executive_summary.overall_colour": 1,
+        "deliverable.scoring_error": 1,
+    }).sort(sort_field, direction).skip(skip).limit(page_size)
+
+    items: List[Dict[str, Any]] = []
+    async for doc in cursor:
+        synth = doc.get("synthesis") or {}
+        deliv = doc.get("deliverable") or {}
+        es = (deliv.get("executive_summary") or {})
+        created_at = doc.get("created_at")
+        completed_at = doc.get("completed_at")
+        dur_sec = None
+        if created_at and completed_at:
+            try:
+                dur_sec = int((datetime.fromisoformat(completed_at) - datetime.fromisoformat(created_at)).total_seconds())
+            except Exception:
+                dur_sec = None
+        items.append({
+            "session_id": doc.get("session_id"),
+            "participant": doc.get("participant") or {},
+            "stage": doc.get("stage"),
+            "status": doc.get("status"),
+            "created_at": created_at,
+            "started_at": doc.get("started_at"),
+            "completed_at": completed_at,
+            "archived": bool(doc.get("archived")),
+            "deleted_at": doc.get("deleted_at"),
+            "hard_delete_at": doc.get("hard_delete_at"),
+            "redacted": bool(doc.get("redacted")),
+            "overall_category": es.get("overall_category"),
+            "overall_colour": es.get("overall_colour"),
+            "synthesis_status": synth.get("status"),
+            "has_scoring_error": bool(deliv.get("scoring_error")),
+            "duration_seconds": dur_sec,
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "filters_applied": {
+            "q": q, "status": status, "archived": archived,
+            "include_deleted": include_deleted,
+            "date_from": date_from, "date_to": date_to,
+            "sort": sort,
+        },
+    }
+
+
 @admin_router.get("/sessions/{session_id}", summary="Get a full session (admin)")
 async def admin_get_session(session_id: str, current=Depends(require_admin)):
     doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Session not found.")
+    # Stamp last_admin_viewed_at — used by future "new since your last visit" UX.
+    now = _now_iso()
+    await sessions_coll.update_one(
+        {"session_id": session_id},
+        {"$set": {"last_admin_viewed_at": now}},
+    )
+    doc["last_admin_viewed_at"] = now
     return doc
+
+
+class AdminSessionPatchIn(BaseModel):
+    archived: Optional[bool] = None
+    notes: Optional[str] = None
+
+    @field_validator("notes")
+    @classmethod
+    def _notes_length(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 2000:
+            raise ValueError("notes must be ≤2000 characters")
+        return v
+
+
+@admin_router.patch("/sessions/{session_id}", summary="Archive toggle + admin notes")
+async def admin_patch_session(session_id: str, payload: AdminSessionPatchIn, current=Depends(require_admin)):
+    doc = await sessions_coll.find_one({"session_id": session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    update: Dict[str, Any] = {"updated_at": _now_iso()}
+
+    if payload.archived is not None:
+        update["archived"] = bool(payload.archived)
+        if payload.archived is True:
+            # Archiving PROTECTS from lifecycle cleanup — clear expiry markers.
+            update["expires_at"] = None
+            update["hard_delete_at"] = None
+        else:
+            # Unarchiving restores the 60-day expiry when the session has a
+            # completion timestamp. If it's not completed, leave expires_at null.
+            completed_at = doc.get("completed_at")
+            if completed_at:
+                try:
+                    ca = datetime.fromisoformat(completed_at)
+                    update["expires_at"] = (ca + SIXTY_DAYS).isoformat()
+                except Exception:
+                    update["expires_at"] = None
+
+    if payload.notes is not None:
+        update["admin_notes"] = payload.notes
+
+    await sessions_coll.update_one({"session_id": session_id}, {"$set": update})
+    await dashboard.invalidate_cache()
+    refreshed = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    return refreshed
+
+
+@admin_router.delete("/sessions/{session_id}", summary="Admin-initiated soft delete (PII scrub, 30d grace)")
+async def admin_soft_delete_session(session_id: str, current=Depends(require_admin)):
+    result = await lifecycle.soft_delete_session(sessions_coll, session_id)
+    if not result.get("ok") and result.get("reason") == "not_found":
+        raise HTTPException(status_code=404, detail="Session not found.")
+    await dashboard.invalidate_cache()
+    return result
+
+
+@admin_router.post("/sessions/{session_id}/restore", summary="Restore a soft-deleted session (within 30d)")
+async def admin_restore_session(session_id: str, current=Depends(require_admin)):
+    result = await lifecycle.restore_session(sessions_coll, session_id)
+    if not result.get("ok"):
+        code = result.get("status_code", 409)
+        reason = result.get("reason", "cannot_restore")
+        detail_map = {
+            "not_found": ("Session not found.", 404),
+            "not_soft_deleted": ("Session is not soft-deleted.", 409),
+            "past_hard_delete_window": ("Restore window has passed.", 409),
+        }
+        msg, hc = detail_map.get(reason, (reason, code))
+        raise HTTPException(status_code=hc, detail=msg)
+    await dashboard.invalidate_cache()
+    return result
+
+
+@admin_router.get("/sessions/{session_id}/conversation/download", summary="Download conversation (MD or JSON)")
+async def admin_download_conversation(
+    session_id: str,
+    format: Literal["markdown", "json"] = "markdown",
+    current=Depends(require_admin),
+):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if format == "json":
+        body = conversation_export.to_json(doc)
+        media_type = "application/json"
+        filename = conversation_export.filename_for(doc, "json")
+    else:
+        body = conversation_export.to_markdown(doc)
+        media_type = "text/markdown; charset=utf-8"
+        filename = conversation_export.filename_for(doc, "md")
+    return FAResponse(
+        content=body,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@admin_router.get("/sessions/{session_id}/deliverable/download", summary="Admin download of the deliverable (PDF/MD)")
+async def admin_download_deliverable(
+    session_id: str,
+    format: Literal["pdf", "markdown"] = "pdf",
+    current=Depends(require_admin),
+):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    deliverable = doc.get("deliverable") or {}
+    if not deliverable or deliverable.get("scoring_error"):
+        raise HTTPException(status_code=409, detail="Deliverable not available for this session.")
+    self_awareness = syn_svc.compute_self_awareness_accuracy(doc)
+    context = results_render.build_context(doc, deliverable, self_awareness)
+    first_name = context["participant"]["first_name"]
+    if format == "pdf":
+        pdf_bytes = results_render.render_pdf(context)
+        filename = results_render.safe_filename(first_name, "pdf")
+        return FAResponse(
+            content=pdf_bytes, media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    md_str = results_render.render_markdown(context)
+    filename = results_render.safe_filename(first_name, "md")
+    return FAResponse(
+        content=md_str, media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@admin_router.get("/dashboard/summary", summary="Aggregate metrics for the admin overview")
+async def admin_dashboard_summary(current=Depends(require_admin)):
+    return await dashboard.get_dashboard_summary(sessions_coll)
+
+
+@admin_router.post("/lifecycle/run", summary="Manually run the soft/hard delete cleanup cycle")
+async def admin_lifecycle_run(current=Depends(require_admin)):
+    summary = await lifecycle.run_cleanup_cycle(sessions_coll, force=True)
+    await dashboard.invalidate_cache()
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -1801,20 +2074,64 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # --------------------------------------------------------------------------- #
 # Startup
 # --------------------------------------------------------------------------- #
+_scheduler: Optional[Any] = None
+
+
+async def _lifecycle_cron_tick() -> None:
+    """APScheduler tick — swallows errors (so the scheduler stays alive)."""
+    try:
+        summary = await lifecycle.run_cleanup_cycle(sessions_coll)
+        if not summary.get("skipped"):
+            logger.info(
+                "Lifecycle cron: soft=%d hard=%d errors=%d scanned_at=%s",
+                summary.get("soft_deleted", 0), summary.get("hard_deleted", 0),
+                summary.get("errors", 0), summary.get("scanned_at"),
+            )
+            # Any change invalidates the dashboard cache.
+            if (summary.get("soft_deleted", 0) + summary.get("hard_deleted", 0)) > 0:
+                await dashboard.invalidate_cache()
+    except Exception as exc:  # pragma: no cover — safety net
+        logger.exception("Lifecycle cron tick failed: %s", exc)
+
+
 @app.on_event("startup")
 async def _on_startup():
-    # Sessions indexes (Phase 2)
+    # Sessions indexes (Phase 2 + 8)
     await sessions_coll.create_index([("resume_code", ASCENDING)], unique=True, name="uniq_resume_code")
     await sessions_coll.create_index([("status", ASCENDING), ("expires_at", ASCENDING)], name="status_expires")
+    # Phase 8 indexes — drive the lifecycle cron + admin list filters + search.
+    await sessions_coll.create_index([("archived", ASCENDING), ("expires_at", ASCENDING)], name="archived_expires")
+    await sessions_coll.create_index([("hard_delete_at", ASCENDING)], name="hard_delete_at")
+    await sessions_coll.create_index([("status", ASCENDING), ("created_at", ASCENDING)], name="status_created")
+    await sessions_coll.create_index([("participant.email", ASCENDING)], name="participant_email", sparse=True)
     # Admin users index
     await admin_users_coll.create_index([("email", ASCENDING)], unique=True, name="uniq_admin_email")
     # Seed
     await _seed_admin_if_empty()
     logger.info("Mongo indexes ensured on sessions + admin_users.")
 
+    # Lifecycle cron — APScheduler AsyncIOScheduler, every 6h.
+    global _scheduler
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        _scheduler = AsyncIOScheduler(timezone="UTC")
+        _scheduler.add_job(_lifecycle_cron_tick, "interval", hours=6, id="lifecycle_cron",
+                           next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5))
+        _scheduler.start()
+        logger.info("Lifecycle cron scheduled every 6h (first tick in ~5 min).")
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Failed to start APScheduler lifecycle cron: %s", exc)
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    global _scheduler
+    if _scheduler is not None:
+        try:
+            _scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        _scheduler = None
     client.close()
 
 

@@ -108,6 +108,368 @@ user_problem_statement: |
   a Save & exit affordance and localStorage hydrate. Placeholder stages remain placeholders.
 
 backend:
+  - task: "Admin dashboard + lifecycle + exports (Phase 8)"
+    implemented: true
+    working: false
+    file: "backend/server.py, backend/services/lifecycle_service.py, backend/services/dashboard_summary.py, backend/services/conversation_export.py"
+    stuck_count: 1
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: false
+          agent: "testing"
+          comment: |
+            Phase 8 backend sweep complete. Ran /app/backend_test.py against
+            https://farm-readiness.preview.emergentagent.com/api (REACT_APP_BACKEND_URL).
+            48/49 assertions PASS. ONE failure (D3) — a privacy regression on
+            the PUBLIC participant-safe GET /api/sessions/{id} endpoint that
+            now leaks admin-only fields added in Phase 8. Details below.
+
+            ============  FAILURE  ============
+            D3. PATCH {notes:"Phase 8 testing admin note"} persists as
+                admin_notes (confirmed in admin GET response). HOWEVER the
+                PUBLIC endpoint GET /api/sessions/{id} ALSO returns the
+                admin_notes field verbatim. The public SessionOut model is
+                declared with `model_config = ConfigDict(extra="allow")` at
+                server.py:214 and the handler at server.py:371-379 only
+                nulls `scores`, `deliverable`, and strips assistant-turn
+                internals from `conversation` — it does NOT pop the Phase-8
+                admin-only fields. Confirmed via curl:
+                  GET /api/sessions/2253141a-…
+                    → {"admin_notes":"Phase 8 testing admin note",
+                        "last_admin_viewed_at":"2026-04-23T…",
+                        "synthesis":{"provider":"emergent","model":
+                          "claude-opus-4-6","fallbacks_tried":0,…},
+                        "hard_delete_at":null, "deleted_at":null,
+                        "redacted":null, …}
+                Critical leak is `admin_notes` — the spec explicitly says
+                "notes field must never appear on public GET /api/sessions/
+                {id}". Also leaking `last_admin_viewed_at` and the
+                `synthesis` sub-doc (provider/model/fallbacks_tried). These
+                are Phase 8 additions that slipped past the public filter.
+                Phase-5 J fix on _public_conversation still holds for the
+                conversation[] array, but the top-level synthesis doc is a
+                separate pass-through.
+                REMEDIATION: in the public get_session handler, pop
+                admin_notes, last_admin_viewed_at, synthesis, deleted_at,
+                hard_delete_at, redacted before returning. (Keeping redacted
+                false-ish is fine but admin_notes / last_admin_viewed_at /
+                synthesis internals must go.)
+
+            ============  PASSED  ============
+            A. Auth gating. All 9 new admin endpoints return 401 without a
+               tra_admin_token cookie (GET/POST/PATCH/DELETE variants
+               covered). ✓
+            B. /admin/sessions list + search + filter + pagination + sort:
+               B1. Baseline returns {items, total, page, page_size,
+                   filters_applied}. ✓
+               B2. q=Ada → 5 items, Ada session found, filters_applied.q
+                   reflects the param. ✓
+               B3. page_size=1 pagination advances: page=1 and page=2 each
+                   return a single different row (total=152). ✓
+               B4. status=completed → 4/4 items all have status==completed. ✓
+               B5. archived=only (0 items, all archived-true) and
+                   archived=exclude (25 items, all archived-false) both
+                   honoured. ✓
+               B6. sort=created_at ascending order verified; sort=-created_at
+                   descending order verified. ✓
+               B7. filters_applied shape correctly reflects ALL params
+                   (q, status, archived, include_deleted, date_from,
+                   date_to, sort). ✓
+               B8. include_deleted=false → every row has deleted_at==null. ✓
+            C. GET /admin/sessions/{id} stamps last_admin_viewed_at:
+               C1. Two back-to-back calls produce distinct, increasing
+                   timestamps (t1 < t2, 1.2s apart). ✓
+               C2. Unknown session → 404. ✓
+            D. PATCH archive + notes semantics:
+               D1. {archived:true} on Ada → archived:true, expires_at:null,
+                   hard_delete_at:null. ✓
+               D2. {archived:false} → expires_at restored to
+                   completed_at + exactly 60 days. ✓
+               D3. **FAILED — see above.** PATCH {notes:"…"} correctly
+                   writes admin_notes on the server, but the field LEAKS to
+                   the public GET /api/sessions/{id}. ✗
+               D4. PATCH {notes:"x"*2001} → 422 (Pydantic validator
+                   enforces ≤2000 chars). ✓
+            E. Admin DELETE → soft delete on a fresh seeded session (given
+               completed_at + expires_at via Mongo so it looked like a
+               completed doc):
+               E1. DELETE → 200 {"ok":true, "soft_deleted":true,
+                   "deleted_at":…, "hard_delete_at":…}. ✓
+               E2. participant.name == "(redacted)", email/org/role all
+                   null. ✓
+               E3. redacted=true, deleted_at + hard_delete_at both set. ✓
+               E4. hard_delete_at - deleted_at == exactly 30 days. ✓
+               E5. scores, deliverable, conversation all preserved
+                   byte-for-byte; scenario.part1_response and
+                   scenario.part2_response also preserved. ✓
+            F. Restore inside the 30-day grace window:
+               F1. POST /restore → 200 {ok:true, restored:true,
+                   pii_recoverable:false}. ✓
+               F2. deleted_at and hard_delete_at cleared; participant.name
+                   stays "(redacted)". ✓
+            G. Restore past grace:
+               G1. Second seeded session: admin-delete then mutate
+                   hard_delete_at to -1 day in Mongo. POST /restore → 409
+                   "Restore window has passed." ✓
+            H. Full lifecycle cron cycle:
+               H1. Third seeded session: mutate expires_at = now-1min,
+                   completed_at = now-61d. POST /admin/lifecycle/run →
+                   {skipped:false, soft_deleted:1, hard_deleted:1,
+                   errors:0}. Incidentally caught the stale leftover from
+                   block G (hard-delete count:1). ✓
+               H2. After that run the fresh session is redacted and has
+                   deleted_at set. ✓
+               H3. Mutate hard_delete_at into the past → POST again →
+                   {hard_deleted:1}. ✓
+               H4. Follow-up admin GET → 404. ✓
+               H5. Back-to-back POSTs to /admin/lifecycle/run both return
+                   skipped:false. Documented behaviour — the manual
+                   endpoint passes force=True to bypass the 5-minute
+                   guard. This is the intended operator experience (a
+                   manual click should always run). The 5-minute guard is
+                   still exercised by the APScheduler _lifecycle_cron_tick.
+                   ✓
+            I. Conversation downloads:
+               I1. format=markdown on Ada → Content-Type
+                   "text/markdown; charset=utf-8", Content-Disposition
+                   filename="TRA-conversation-Ada-Lovelace-2026-04-23.md",
+                   body contains "Interviewer", "Participant", and the
+                   session_id. ✓
+               I2. format=json on Ada → Content-Type "application/json",
+                   filename TRA-conversation-Ada-Lovelace-2026-04-23.json,
+                   body parses to {session_id, conversation:[15 turns],
+                   scoring, …}. ✓
+               I3. Fresh seeded session, admin-delete, then download
+                   markdown: filename uses "session-{first_8_of_sid}"
+                   label, body contains ZERO hits of the seed email
+                   (ada.test@example.co.uk) or organisation (Analytical
+                   Engine Co). ✓
+               I4. Same redacted session via format=json: participant_label
+                   starts with "(redacted)", body contains zero hits of
+                   email/org. ✓
+            J. Deliverable admin downloads:
+               J1. format=pdf on Ada → 200, Content-Type "application/pdf",
+                   body begins b"%PDF-". ✓
+               J2. format=markdown → 200, Content-Type text/markdown,
+                   body starts "# Transformation Readiness Assessment". ✓
+               J3. After PATCHing Ada to archived=true → PDF download
+                   STILL works (starts %PDF-). Archive=false restored. ✓
+            K. Dashboard summary:
+               K1. Top-level keys present: totals, completed_this_week,
+                   completed_last_week, avg_completion_duration_seconds,
+                   score_distribution, dimension_averages, activity_14d,
+                   generated_at. ✓
+               K2. totals has total_sessions=154, in_progress=3,
+                   completed=5, failed=2, archived=0, soft_deleted=1,
+                   expiring_soon=0 — all seven keys present. ✓
+               K3. dimension_averages length == 6. ✓
+               K4. activity_14d length == 14. ✓
+               K5. score_distribution carries navy/gold/terracotta
+                   (plus unknown bucket). {navy:0, gold:2, terracotta:0,
+                   unknown:0}. ✓
+               K6. Two calls 1s apart return identical generated_at →
+                   60s cache hit confirmed. ✓
+            L. Regression — Phases 2-7:
+               L1. POST /api/sessions (fresh X-Forwarded-For) → 201 with
+                   session_id + resume_code. ✓
+               L2. GET /assessment/psychometric/next → 200 with item. ✓
+               L3. POST /assessment/psychometric/answer → 200. ✓
+               L4. POST /assessment/ai-discussion/start on an
+                   identity-stage session → 409. ✓
+               L5. GET /assessment/scenario/state(Ada) → 200. ✓
+               L6. GET /assessment/processing/state(Ada) → 200 with
+                   status:"completed". ✓
+               L7. GET /assessment/results(Ada) → 200 with status:"ok". ✓
+            M. /api/openapi.json enumerates exactly 35 /api/* paths
+               (29 prior + 6 Phase 8 new). ✓
+            N. Log hygiene: grep over /var/log/supervisor/backend.{out,err}.log
+               for "ada.test@example.co.uk", "Analytical Engine Co",
+               "Chief Mathematician" — ZERO INFO-level hits, even after
+               executing soft-delete and hard-delete events. Soft-delete
+               logs only the session_id (lifecycle_service.py:80 confirms:
+               `"Soft-deleted session %s (hard_delete_at=%s)"`). ✓
+
+            NOTES / OBSERVATIONS (non-blocking):
+              (i)  The public GET /api/sessions/{id} SessionOut model uses
+                   ConfigDict(extra="allow"). That pattern was fine in
+                   Phases 2-7 because the only admin-internal fields then
+                   were `scores` and `deliverable`, which the handler
+                   explicitly nulls. Phase 8 added admin_notes,
+                   last_admin_viewed_at, and the synthesis sub-doc as new
+                   fields without adding them to the participant-safe
+                   filter. The fix is a ~6-line handler update, not a
+                   model redesign.
+              (ii) Public GET also exposes `synthesis.provider` /
+                   `synthesis.model` / `synthesis.fallbacks_tried` for
+                   completed sessions. Phase 5 J fix only strips those from
+                   conversation[] assistant turns — the top-level
+                   synthesis doc is a separate object. Consider whether
+                   this is acceptable (probably not for a participant).
+              (iii) hard_delete_at / deleted_at / redacted also pass through
+                    to the public endpoint. Not personal data, but telegraphs
+                    lifecycle state to participants. Worth tightening.
+
+            Test-side cleanup: removed test admin_notes +
+            last_admin_viewed_at from the Ada session after the sweep.
+            Fresh seeded sessions used for E/F/G/H are now hard-deleted or
+            marked redacted (as designed). No code changes were made during
+            testing. Main agent should address D3/remediation only; all
+            other Phase 8 behaviour is green.
+        - working: "NA"
+          agent: "main"
+          comment: |
+            Phase 8 implementation complete, live smoke-tested end-to-end incl.
+            a forced full lifecycle cycle (soft-delete -> restore -> hard-delete).
+            Ready for deep_testing_backend_v2 sweep.
+
+            New services:
+              - services/lifecycle_service.py — two-stage retention. run_cleanup_cycle
+                finds non-archived, non-deleted sessions with expires_at <= now and
+                soft-deletes them (scrubs participant PII, sets deleted_at + redacted
+                + hard_delete_at=+30d; preserves scores, conversation, scenario
+                responses, deliverable). Then finds any doc with hard_delete_at <=
+                now and removes it. Per-session try/except so one bad doc cannot
+                halt the sweep. 5-minute min-run-interval guard avoids back-to-back
+                runs from cron + manual trigger. Archive=true clears expires_at ->
+                protected from both stages. restore_session() unwinds deleted_at +
+                hard_delete_at within the 30-day grace, flags pii_recoverable=false.
+              - services/conversation_export.py — Markdown and JSON exporters.
+                Markdown has H1 title + Participant/Interviewer H2 per turn +
+                timestamp + admin-only provider/model/latency trailer on assistant
+                turns + scoring summary footer. Redacted sessions render as
+                "(redacted) session {first_8}" with no email or organisation leaked.
+                Filename sanitiser: TRA-conversation-{label}-{YYYY-MM-DD}.{md|json}.
+              - services/dashboard_summary.py — aggregate metrics producer with a
+                60-second in-memory cache (double-checked locking). Totals:
+                {total_sessions, in_progress, completed, failed, archived,
+                soft_deleted, expiring_soon (within 7d & not archived)}. Weekly
+                deltas completed_this_week / completed_last_week. Avg completion
+                duration (last 30d). Score distribution by band colour from each
+                deliverable.executive_summary.overall_colour. Dimension averages
+                per assessed dim over last 30d. 14-day activity (new_sessions +
+                completions per UTC day). Cache invalidated on any admin write
+                (patch, delete, restore, lifecycle run).
+
+            New endpoints (all admin JWT-gated):
+              GET  /api/admin/sessions?q=&status=&include_deleted=&archived=&date_from=&date_to=&page=&page_size=&sort=
+                   Returns {items, total, page, page_size, filters_applied}.
+                   Each row: session_id, participant, stage, status, dates,
+                   archived, deleted_at, hard_delete_at, redacted,
+                   overall_category, overall_colour, synthesis_status,
+                   has_scoring_error, duration_seconds. Case-insensitive regex
+                   search over name/email/organisation/session_id. Status is
+                   comma-separated whitelist. Sort whitelist enforced.
+              GET  /api/admin/sessions/{id}
+                   Full doc + stamps last_admin_viewed_at on each call.
+              PATCH /api/admin/sessions/{id}
+                   Body {archived?: bool, notes?: string (<=2000)}. Archive=true
+                   clears expires_at + hard_delete_at; archive=false restores
+                   expires_at to completed_at+60d when completed_at present.
+                   admin_notes is the private field.
+              DELETE /api/admin/sessions/{id}
+                   Admin-initiated immediate soft-delete (PII scrub, 30d grace).
+              POST /api/admin/sessions/{id}/restore
+                   409 if not soft-deleted or past hard_delete_at; 200 with
+                   pii_recoverable:false flag on success.
+              GET  /api/admin/sessions/{id}/conversation/download?format=markdown|json
+                   Streams text/markdown or application/json body with sanitised
+                   Content-Disposition filename. Works on redacted sessions
+                   (admin exports are allowed post-redaction) with
+                   "(redacted)" label instead of the participant's real name.
+              GET  /api/admin/sessions/{id}/deliverable/download?format=pdf|markdown
+                   Thin wrapper around the Phase 7 renderer; works even if the
+                   session is archived.
+              GET  /api/admin/dashboard/summary
+                   Single-call aggregate for the Overview dashboard.
+              POST /api/admin/lifecycle/run
+                   On-demand trigger for the cleanup cycle (force=True bypasses
+                   the 5-minute guard). Returns {soft_deleted, hard_deleted,
+                   errors, scanned_at}.
+
+            Mongo changes:
+              - New fields on `sessions`: deleted_at, hard_delete_at, redacted,
+                last_admin_viewed_at, admin_notes.
+              - New indexes (created at startup):
+                  {archived, expires_at}        archived_expires
+                  {hard_delete_at}              hard_delete_at
+                  {status, created_at}          status_created
+                  {participant.email} (sparse)  participant_email
+
+            APScheduler:
+              - AsyncIOScheduler started on app startup, tz=UTC, runs
+                _lifecycle_cron_tick every 6 hours; first tick 5 minutes after
+                startup. Shuts down cleanly on app shutdown. Tick wraps the
+                cycle in try/except; per-cycle errors logged and swallowed so
+                the scheduler stays alive.
+
+            Live smoke evidence (one forced full cycle):
+              - Seeded fresh session, mutated expires_at into the past.
+              - POST /admin/lifecycle/run -> {soft_deleted:1, hard_deleted:0}.
+              - Admin GET shows redacted=true, deleted_at + hard_delete_at set,
+                participant.name=="(redacted)", participant.email==null,
+                scores still intact.
+              - POST /admin/sessions/{id}/restore -> {ok:true, restored:true,
+                pii_recoverable:false}. deleted_at/hard_delete_at cleared;
+                participant.name stays "(redacted)".
+              - Mutated hard_delete_at into the past, re-ran lifecycle ->
+                {hard_deleted:1}. Follow-up GET -> 404.
+
+            Unit tests: 12 new in tests/test_phase8_services.py covering:
+              - soft-delete of expired non-archived doc
+              - archive protection
+              - hard-delete after window
+              - admin soft-delete + restore within grace; PII not recoverable
+              - restore 409 past hard_delete_at
+              - 5-minute run guard
+              - per-session error isolation
+              - Markdown export contains both roles + meta trailer + scoring
+                summary; redacted version hides PII
+              - JSON export round-trip
+              - filename sanitisation for both named and redacted sessions
+              - dashboard_summary tiles on a canned 9-session dataset (totals,
+                score_distribution, dim_averages length=6, activity_14d length=14)
+            All 109 tests green (60 prior + 37 Phase 7 + 12 Phase 8).
+
+            Frontend (polished executive grade):
+              - /admin layout: navy header bar with gold accent, left nav
+                (Overview / Sessions / Settings) with active gold left bar,
+                responsive collapse to hamburger on mobile.
+              - /admin (Overview): 4 stat tiles (Total sessions w/ 14-day
+                sparkline, Completed this week w/ weekly delta arrow, Avg
+                completion time, Expiring within 7 days), score distribution
+                donut, dimension averages bars, 14-day activity chart, recent
+                sessions table. All charts are hand-rolled inline SVG (no CDN).
+              - /admin/sessions: search (debounced 300ms), status multi-select,
+                archived toggle, include-deleted toggle, sort dropdown,
+                pagination (25/page default). Row actions menu (View, Archive,
+                Soft delete, Restore) with confirmation.
+              - /admin/sessions/{id}: navy ribbon with participant / session_id
+                (copy) / status pills / action rail (PDF, MD, Convo MD, Convo
+                JSON, Archive toggle, Soft delete/Restore) + lifecycle strip
+                (Created/Started/Completed/Expires). Seven tabs:
+                  Overview: exec summary prose + dimension RADAR chart +
+                    self-awareness calibration bar.
+                  Psychometric: LA + TA score cards with subscale bars; full
+                    20-item response table with position or response-time sort.
+                  AI Discussion: rendered conversation with admin-only
+                    provider/model/latency/fallbacks trailer; expandable raw
+                    scores.ai_fluency JSON.
+                  Scenario: Part 1 / Part 2 q1/q2/q3 side-by-side; CF + ST
+                    score cards with evidence objects (connections identified
+                    vs missed as two columns, key_quote in italic).
+                  Deliverable: full 6-section inline render of
+                    session.deliverable with navy/gold/terracotta chips.
+                  Timeline: merged event timeline (session events + psychometric
+                    answers + conversation turns + scenario transitions +
+                    synthesis start/complete + soft-delete event + last admin
+                    view) sorted chronologically.
+                  Notes: auto-save (1s debounce) with character counter (0/2000).
+              - /admin/settings: existing LLM key UI preserved; new Lifecycle
+                panel below with the 60/90 day policy copy + "Run cleanup now"
+                button that posts to /admin/lifecycle/run and shows a result
+                pill.
+
   - task: "Processing + Results + Synthesis (Phase 7)"
     implemented: true
     working: true
@@ -720,10 +1082,10 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Phase 7 — Processing + Results endpoints"
-    - "Synthesis via 3-tier llm_router (two-call split: narrative + structured)"
-    - "Results JSON + PDF + Markdown download; privacy (public vs admin reads)"
-    - "Regression: Phases 2–6 endpoints still green"
+    - "Phase 8 — Admin dashboard + lifecycle cron + exports + lifecycle endpoints"
+    - "Soft-delete / hard-delete / restore cycle (with time-frozen verification)"
+    - "Conversation exports (Markdown + JSON) + deliverable admin downloads"
+    - "Regression: Phases 2–7 endpoints still respond correctly"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -731,8 +1093,77 @@ test_plan:
 agent_communication:
     - agent: "main"
       message: |
-        Phase 7 (Processing + Results + Doc 23 synthesis) is code-complete and
-        has passed a full live smoke run end-to-end. Requesting a thorough
+        Phase 8 (Admin dashboard + lifecycle cron + exports) is code-complete
+        and live smoke-tested end-to-end. Requesting a thorough
+        deep_testing_backend_v2 sweep of the new admin surface. The exact
+        target list is in the "Admin dashboard + lifecycle + exports (Phase 8)"
+        task entry at the top of /app/test_result.md.
+
+        Quick orientation:
+
+        Internal base URL: http://localhost:8001/api
+        Admin creds: steve@org-logic.io / test1234 (cookie is Secure — use
+        explicit Cookie header).
+
+        Seven+ new endpoints to exercise:
+          GET    /api/admin/sessions              — list w/ search/filter/sort/page
+          GET    /api/admin/sessions/{id}         — full doc (stamps last_admin_viewed_at)
+          PATCH  /api/admin/sessions/{id}         — {archived?, notes?} incl. expires_at recalc
+          DELETE /api/admin/sessions/{id}         — admin-initiated soft delete
+          POST   /api/admin/sessions/{id}/restore — restore within 30d; PII not recoverable
+          GET    /api/admin/sessions/{id}/conversation/download?format=markdown|json
+          GET    /api/admin/sessions/{id}/deliverable/download?format=pdf|markdown (Phase 7 renderer via admin route)
+          GET    /api/admin/dashboard/summary     — cached 60s aggregates
+          POST   /api/admin/lifecycle/run         — manual cleanup trigger
+
+        Verifications I would like covered (see status_history for the full
+        list; highlights):
+
+          1. Search + filter + pagination + sort on /admin/sessions with
+             various combinations; assert total/page/page_size metadata.
+          2. PATCH archive=true clears expires_at + hard_delete_at;
+             archive=false restores expires_at = completed_at + 60d when the
+             session is completed.
+          3. DELETE then GET: participant.name == "(redacted)",
+             participant.email is null, redacted=true, deleted_at +
+             hard_delete_at set, but scores/conversation/scenario
+             responses/deliverable preserved.
+          4. Restore within 30d -> 200 {ok:true, restored:true,
+             pii_recoverable:false}. PII stays "(redacted)".
+          5. Restore after 30d (mutate hard_delete_at into the past) -> 409.
+          6. Full cycle via POST /admin/lifecycle/run with time-frozen
+             expires_at and hard_delete_at — soft_deleted/hard_deleted counts
+             match expectations.
+          7. Conversation downloads: correct Content-Type, non-empty body,
+             sanitised Content-Disposition filename, correct content shape.
+             Redacted sessions still work (exports allowed after redaction)
+             and NEVER leak email/organisation.
+          8. Deliverable admin downloads (pdf/markdown) work even for
+             archived sessions.
+          9. Dashboard summary: shape and caching (hit once, then again
+             within 60s — should be identical without any mutation).
+         10. Non-admin requests to all new endpoints -> 401.
+         11. Regression: Phases 2-7 endpoints all still respond correctly.
+         12. /api/openapi.json now enumerates 35 /api/* paths (29 prior + 6
+             new Phase 8 paths, counting METHODS on the same path once).
+         13. Log hygiene: no participant email/organisation/role/answer
+             content/API keys/deliverable content at INFO level in
+             /var/log/supervisor/backend.*.log even when a soft-delete event
+             fires.
+
+        A fresh fully-scored session is trivial to mint via
+          `python /app/backend/seed_phase7_test_session.py`
+        which prints a session_id + resume_code.
+
+        Please update the Phase 8 task's status_history with letter-coded
+        findings (consistent with prior phases). Do not change the test_plan
+        block or any other phase's task entries.
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 7 (Processing + Results + Doc 23 synthesis) was code-complete and
+        passed a full live smoke run end-to-end. Requesting a thorough
         deep_testing_backend_v2 sweep of the new surface before handing back.
 
         Please test against http://localhost:8001/api.
@@ -1391,4 +1822,91 @@ backend:
              PATCH /api/sessions/{session_id}/stage, GET /api/sessions/{session_id}).
         No code changes were made. All priority-high backend tasks are working; nothing is
         stuck. Main agent can proceed with Phase 3.
+
+
+    - agent: "testing"
+      message: |
+        Phase 8 backend sweep: 48/49 assertions PASS. See the
+        "Admin dashboard + lifecycle + exports (Phase 8)" task's
+        status_history for the full letter-coded detail (A, B1-B8, C1-C2,
+        D1-D4, E1-E5, F1-F2, G1, H1-H5, I1-I4, J1-J3, K1-K6, L1-L7, M, N).
+
+        ONE FAILURE — privacy regression on public GET /api/sessions/{id}:
+
+        D3 FAIL. The public participant-safe session endpoint at
+        server.py:369-379 now leaks three Phase-8-added admin fields:
+          - admin_notes           (explicitly forbidden in the spec)
+          - last_admin_viewed_at  (admin-only lifecycle metric)
+          - synthesis.{provider,model,fallbacks_tried,…}
+                                  (admin internals — the Phase 5 J fix
+                                   stripped these from conversation[]
+                                   turns only; the top-level synthesis
+                                   sub-document is a separate object)
+
+        Also exposed (borderline — probably wanted suppressed too):
+        hard_delete_at, deleted_at, redacted.
+
+        Root cause: SessionOut model uses
+          model_config = ConfigDict(extra="allow")
+        (server.py:214) and the handler only explicitly nulls scores,
+        deliverable, and strips assistant-turn internals from the
+        conversation array. New Phase-8 fields pass through untouched.
+
+        REMEDIATION — small targeted patch in server.py:get_session:
+          doc.pop("admin_notes", None)
+          doc.pop("last_admin_viewed_at", None)
+          doc.pop("synthesis", None)
+          doc.pop("deleted_at", None)
+          doc.pop("hard_delete_at", None)
+          doc.pop("redacted", None)
+        before constructing SessionOut. Admin endpoints already expose
+        these fields separately so no admin functionality breaks.
+
+        Everything else green:
+          - All 9 new admin endpoints 401-gated (A).
+          - List search/filter/pagination/sort all honoured; filters_applied
+            shape correct; include_deleted toggle works (B1-B8).
+          - last_admin_viewed_at stamps on every admin GET (C1).
+          - Archive toggle correctly clears expires_at + hard_delete_at on
+            archive-true and restores expires_at = completed_at + 60d on
+            archive-false (D1-D2). Notes >2000 chars → 422 (D4).
+          - Soft delete scrubs PII, preserves scores/deliverable/
+            conversation/scenario responses, sets redacted=true and
+            hard_delete_at = +30d (E1-E5).
+          - Restore within grace → ok; participant stays "(redacted)"
+            (F1-F2). Restore past grace → 409 (G1).
+          - Lifecycle cron full cycle: forced soft-delete pass, redaction
+            confirmed, forced hard-delete pass, follow-up GET → 404
+            (H1-H4). Manual endpoint documented as force=True (H5).
+          - Conversation MD/JSON downloads correct Content-Type,
+            Content-Disposition, and body (Interviewer/Participant/
+            session_id). Redacted sessions use "session-{first_8}"
+            filename and strip all PII (I1-I4).
+          - Deliverable admin downloads PDF (%PDF-…) and MD
+            (# Transformation Readiness Assessment…), works for archived
+            sessions (J1-J3).
+          - Dashboard summary shape complete; dimension_averages=6,
+            activity_14d=14, score_distribution{navy/gold/terracotta}
+            present; cache hit confirmed (identical generated_at on
+            back-to-back calls) (K1-K6).
+          - Regression: sessions CRUD, psychometric/next+answer,
+            ai-discussion gate, scenario/state, processing/state(Ada),
+            results(Ada) all intact (L1-L7).
+          - OpenAPI enumerates exactly 35 /api/* paths (M).
+          - Log hygiene: zero INFO-level hits of ada.test email /
+            Analytical Engine Co / Chief Mathematician across
+            backend.{out,err}.log, even after soft/hard-delete events
+            fired. Soft-delete log format confirmed as session_id-only
+            (lifecycle_service.py:80) (N1).
+
+        Test harness note: used the public REACT_APP_BACKEND_URL host
+        since the admin cookie is Secure. Fresh X-Forwarded-For on
+        regression POST /sessions to sidestep the per-IP rate limit.
+        Three fresh seeded sessions consumed for soft-delete / restore /
+        lifecycle cycles — all either restored or hard-deleted by end of
+        run; Ada session left intact with admin_notes +
+        last_admin_viewed_at cleaned up.
+
+        Main agent: please address the D3 leak (small handler patch).
+        Everything else is ready to ship.
 
