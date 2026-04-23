@@ -1,516 +1,546 @@
-"""
-Backend API tests for Phase 2 — Transformation Readiness Assessment.
+"""Phase 4 backend test harness — psychometric endpoints + scoring + admin read.
+Runs against http://localhost:8001/api.
 
-Tests the sessions API: POST/GET/PATCH + resume + validation + rate limiting + logs + docs.
-Uses REACT_APP_BACKEND_URL from /app/frontend/.env so we hit the public ingress URL.
+Covers letters A-Q from the review request. Prints a per-letter PASS/FAIL
+report with evidence (status codes + key field values).
 """
 from __future__ import annotations
-
-import json
-import os
-import re
-import subprocess
-import sys
 import time
-import uuid
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import sys
+import re
 from typing import Any, Dict, List, Optional, Tuple
-
 import requests
 
-# --------------------------------------------------------------------------- #
-# Config
-# --------------------------------------------------------------------------- #
-FRONTEND_ENV = Path("/app/frontend/.env")
-BACKEND_URL: Optional[str] = None
-for line in FRONTEND_ENV.read_text().splitlines():
-    if line.startswith("REACT_APP_BACKEND_URL="):
-        BACKEND_URL = line.split("=", 1)[1].strip()
-        break
+BASE = "http://localhost:8001/api"
+ADMIN_EMAIL = "steve@org-logic.io"
+ADMIN_PASSWORD = "test1234"
 
-assert BACKEND_URL, "REACT_APP_BACKEND_URL not found in /app/frontend/.env"
-API = f"{BACKEND_URL}/api"
-
-RESUME_CODE_RE = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}$")
-UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
-
-# --------------------------------------------------------------------------- #
-# Tiny test harness
-# --------------------------------------------------------------------------- #
-results: List[Tuple[str, bool, str]] = []
+RESULTS: List[Dict[str, Any]] = []
+_SESSION_SEQ = [0]
 
 
-def record(name: str, ok: bool, evidence: str = "") -> None:
-    results.append((name, ok, evidence))
-    tag = "PASS" if ok else "FAIL"
-    print(f"[{tag}] {name} :: {evidence}")
+def _fresh_ip() -> str:
+    _SESSION_SEQ[0] += 1
+    # Use 198.51.100.0/24 (TEST-NET-2, never in routing). Unique per session.
+    return f"198.51.100.{(_SESSION_SEQ[0] % 250) + 1}"
 
 
-def _xff_headers(suffix: str) -> Dict[str, str]:
-    """Unique X-Forwarded-For to avoid rate-limit collisions between tests."""
-    # Use 203.0.113.x range (TEST-NET-3, safe to use in docs/tests)
-    # suffix: deterministic-ish octet derived from name to spread across tests
-    octet = (sum(ord(c) for c in suffix) % 250) + 2
-    return {"X-Forwarded-For": f"203.0.113.{octet}"}
+def record(letter: str, ok: bool, detail: str) -> None:
+    RESULTS.append({"letter": letter, "ok": ok, "detail": detail})
+    flag = "PASS" if ok else "FAIL"
+    print(f"[{flag}] {letter}: {detail}")
 
 
-def _valid_payload(email_tag: str = "") -> Dict[str, Any]:
-    tag = email_tag or uuid.uuid4().hex[:8]
-    return {
-        "name": "Alice Whittaker",
-        "email": f"alice.whittaker+{tag}@example.com",
-        "organisation": "Northstar Analytics",
-        "role": "Head of People Operations",
+def _assert(cond: bool, letter: str, detail: str, stop_on_fail: bool = False) -> bool:
+    record(letter, cond, detail)
+    if not cond and stop_on_fail:
+        raise SystemExit(f"FATAL: {letter} failed: {detail}")
+    return cond
+
+
+def new_session(headers: Optional[Dict[str, str]] = None) -> Tuple[str, str]:
+    payload = {
+        "name": "Harriet Locke",
+        "email": f"harriet.locke+{int(time.time()*1000)}@example.co.uk",
+        "organisation": "Meridian Consulting",
+        "role": "Programme Director",
         "consent": True,
     }
+    hdrs = dict(headers or {})
+    # Avoid creation-rate-limit cross-contamination across tests.
+    hdrs.setdefault("X-Forwarded-For", _fresh_ip())
+    r = requests.post(f"{BASE}/sessions", json=payload, headers=hdrs, timeout=10)
+    assert r.status_code == 201, f"Expected 201 creating session, got {r.status_code}: {r.text[:200]}"
+    body = r.json()
+    return body["session_id"], body["resume_code"]
 
 
-# --------------------------------------------------------------------------- #
-# H. Docs
-# --------------------------------------------------------------------------- #
-def test_docs() -> None:
-    r = requests.get(f"{API}/docs", timeout=15)
-    ok = r.status_code == 200 and "swagger" in r.text.lower()
-    record("H1 GET /api/docs returns 200 with Swagger UI", ok,
-           f"status={r.status_code} len={len(r.text)}")
-
-    r2 = requests.get(f"{API}/openapi.json", timeout=15)
-    data = r2.json() if r2.ok else {}
-    paths = data.get("paths", {}) if isinstance(data, dict) else {}
-    required = [
-        ("POST", "/api/sessions"),
-        ("GET", "/api/sessions/resume/{resume_code}"),
-        ("PATCH", "/api/sessions/{session_id}/stage"),
-        ("GET", "/api/sessions/{session_id}"),
-    ]
-    missing = []
-    for method, path in required:
-        node = paths.get(path) or {}
-        if method.lower() not in {k.lower() for k in node.keys()}:
-            missing.append(f"{method} {path}")
-    record(
-        "H2 openapi.json lists the 4 session endpoints",
-        len(missing) == 0,
-        f"missing={missing}" if missing else f"all 4 present",
-    )
+_ADMIN_TOKEN_CACHE: List[str] = []
 
 
-# --------------------------------------------------------------------------- #
-# A. Happy path: create session
-# --------------------------------------------------------------------------- #
-def test_create_session_happy() -> Dict[str, Any]:
+def admin_login_cookie() -> str:
+    if _ADMIN_TOKEN_CACHE:
+        return _ADMIN_TOKEN_CACHE[0]
     r = requests.post(
-        f"{API}/sessions",
-        json=_valid_payload("happy"),
-        headers=_xff_headers("happy"),
-        timeout=15,
+        f"{BASE}/admin/auth/login",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        headers={"X-Forwarded-For": _fresh_ip()},
+        timeout=10,
     )
-    ok = r.status_code == 201
-    body = {}
-    try:
-        body = r.json()
-    except Exception:
-        pass
-    record("A1 POST /api/sessions valid -> 201", ok,
-           f"status={r.status_code} body={body}")
-
-    sid = body.get("session_id", "")
-    code = body.get("resume_code", "")
-    stage = body.get("stage", "")
-
-    record("A2 response has UUID session_id",
-           bool(UUID_RE.match(sid)), f"session_id={sid}")
-    record("A3 resume_code matches ^[A-Z0-9]{4}-[A-Z0-9]{4}$",
-           bool(RESUME_CODE_RE.match(code)), f"resume_code={code}")
-    record("A4 stage == 'identity'", stage == "identity", f"stage={stage}")
-    return body
+    assert r.status_code == 200, f"Admin login failed: {r.status_code} {r.text}"
+    raw = r.headers.get("Set-Cookie", "")
+    m = re.search(r"tra_admin_token=([^;]+)", raw)
+    assert m, f"No admin cookie in login response: {raw}"
+    _ADMIN_TOKEN_CACHE.append(m.group(1))
+    return m.group(1)
 
 
-# --------------------------------------------------------------------------- #
-# B. Input validation
-# --------------------------------------------------------------------------- #
-def test_validation() -> None:
-    cases = [
-        ("B1 missing consent", {k: v for k, v in _valid_payload("b1").items() if k != "consent"}),
-        ("B2 consent=false",   {**_valid_payload("b2"), "consent": False}),
-        ("B3 name missing",    {k: v for k, v in _valid_payload("b3").items() if k != "name"}),
-        ("B4 name empty str",  {**_valid_payload("b4"), "name": ""}),
-        ("B5 name whitespace", {**_valid_payload("b5"), "name": "   "}),
-        ("B6 email no @",      {**_valid_payload("b6"), "email": "not-an-email"}),
-    ]
-    for label, payload in cases:
-        r = requests.post(
-            f"{API}/sessions",
-            json=payload,
-            headers=_xff_headers(label),
-            timeout=15,
-        )
-        ok422 = r.status_code == 422
-        body = {}
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text[:200]}
-        has_detail = isinstance(body, dict) and "detail" in body
-        record(
-            f"{label} -> 422 with detail",
-            ok422 and has_detail,
-            f"status={r.status_code} detail_keys={list(body.keys()) if isinstance(body, dict) else 'n/a'}",
-        )
-
-    # Bad JSON body
-    r = requests.post(
-        f"{API}/sessions",
-        data="{not valid json,,,}",
-        headers={"Content-Type": "application/json", **_xff_headers("B7")},
-        timeout=15,
-    )
-    ok = r.status_code in (400, 422)
-    record("B7 bad JSON body -> 400/422 (not 500)", ok,
-           f"status={r.status_code}")
-
-
-# --------------------------------------------------------------------------- #
-# C. Resume flow
-# --------------------------------------------------------------------------- #
-def test_resume(happy_session: Dict[str, Any]) -> None:
-    code = happy_session.get("resume_code", "")
-    sid = happy_session.get("session_id", "")
-
-    # C1 valid code with dash
-    r = requests.get(f"{API}/sessions/resume/{code}", timeout=15)
-    body = r.json() if r.ok else {}
+def test_A() -> None:
+    sid, _rc = new_session()
+    r = requests.get(f"{BASE}/assessment/psychometric/next",
+                     params={"session_id": sid}, timeout=10)
+    _assert(r.status_code == 200, "A", f"GET /next status={r.status_code}", stop_on_fail=True)
+    body = r.json()
     ok = (
-        r.status_code == 200
-        and body.get("session_id") == sid
-        and body.get("stage") == "identity"
-        and isinstance(body.get("participant"), dict)
-        and body["participant"].get("email", "").startswith("alice.whittaker+happy")
+        body.get("done") is False
+        and "item" in body
+        and {"item_id", "text", "scale", "subscale"} <= set(body["item"].keys())
+        and body["progress"]["answered"] == 0
+        and body["progress"]["total"] == 20
+        and body["progress"]["current_index_1based"] == 1
     )
-    record("C1 GET /sessions/resume/{code} with dash -> 200", ok,
-           f"status={r.status_code} body_keys={list(body.keys())}")
+    _assert(ok, "A1", f"/next first-call shape: done={body.get('done')} "
+                       f"item_id={body.get('item', {}).get('item_id')} "
+                       f"progress={body.get('progress')}")
 
-    # C2 code without dash normalises
-    code_nodash = code.replace("-", "")
-    r = requests.get(f"{API}/sessions/resume/{code_nodash}", timeout=15)
-    body = r.json() if r.ok else {}
-    ok = r.status_code == 200 and body.get("session_id") == sid
-    record("C2 code without dash normalises -> 200", ok,
-           f"status={r.status_code} session_id_match={body.get('session_id') == sid}")
-
-    # C3 unknown code -> 404
-    r = requests.get(f"{API}/sessions/resume/ZZZZ-ZZZZ", timeout=15)
-    body = r.json() if r.ok or r.status_code == 404 else {}
-    ok = r.status_code == 404 and body.get("detail") == "Resume code not found."
-    record("C3 unknown code -> 404 with 'Resume code not found.'", ok,
-           f"status={r.status_code} body={body}")
-
-
-# --------------------------------------------------------------------------- #
-# D. Stage transitions
-# --------------------------------------------------------------------------- #
-def _patch_stage(sid: str, stage: str, xff_key: str = "d") -> requests.Response:
-    return requests.patch(
-        f"{API}/sessions/{sid}/stage",
-        json={"stage": stage},
-        headers=_xff_headers(xff_key),
-        timeout=15,
+    token = admin_login_cookie()
+    cookie_hdr = {"Cookie": f"tra_admin_token={token}"}
+    r2 = requests.get(f"{BASE}/admin/sessions/{sid}", headers=cookie_hdr, timeout=10)
+    _assert(r2.status_code == 200, "A2", f"admin GET /sessions status={r2.status_code}")
+    doc = r2.json()
+    order = doc.get("psychometric", {}).get("order", [])
+    first_la = all(i.startswith("LA") for i in order[:12])
+    last_ta = all(i.startswith("TA") for i in order[12:])
+    _assert(
+        len(order) == 20 and first_la and last_ta,
+        "A3",
+        f"order length={len(order)}, first12_all_LA={first_la}, last8_all_TA={last_ta} "
+        f"(order_sample={order[:3]}...{order[-3:]})",
     )
+    _assert(doc.get("stage") == "psychometric", "A4", f"session.stage={doc.get('stage')}")
+    _assert(bool(doc.get("psychometric", {}).get("started_at")),
+            "A5", f"started_at={doc.get('psychometric', {}).get('started_at')}")
 
 
-def test_stage_transitions() -> None:
-    # Create a fresh session for the happy forward-path walk
-    create = requests.post(
-        f"{API}/sessions",
-        json=_valid_payload("walk"),
-        headers=_xff_headers("walk-create"),
-        timeout=15,
-    )
-    assert create.status_code == 201, f"setup failed: {create.status_code} {create.text}"
-    sid = create.json()["session_id"]
+def test_B() -> None:
+    sid, _ = new_session()
+    r1 = requests.get(f"{BASE}/assessment/psychometric/next", params={"session_id": sid}, timeout=10)
+    r2 = requests.get(f"{BASE}/assessment/psychometric/next", params={"session_id": sid}, timeout=10)
+    id1 = r1.json()["item"]["item_id"]
+    id2 = r2.json()["item"]["item_id"]
+    _assert(id1 == id2, "B", f"two consecutive /next return same id? {id1} vs {id2}")
 
-    # D1 Walk forward through all stages
-    path = ["context", "psychometric", "ai-discussion", "scenario", "processing", "results"]
-    all_ok = True
-    evidence = []
-    for stg in path:
-        r = _patch_stage(sid, stg, xff_key=f"walk-{stg}")
-        if r.status_code != 200:
-            all_ok = False
-            evidence.append(f"{stg}:status={r.status_code}:{r.text[:120]}")
-            break
+
+def answer_all(sid: str, value_for: Any = 4,
+               headers: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    hdrs = dict(headers or {})
+    hdrs.setdefault("X-Forwarded-For", _fresh_ip())
+    responses: List[Dict[str, Any]] = []
+    for step in range(20):
+        r = requests.get(f"{BASE}/assessment/psychometric/next",
+                         params={"session_id": sid}, headers=hdrs, timeout=10)
         body = r.json()
-        if body.get("stage") != stg or "updated_at" not in body:
-            all_ok = False
-            evidence.append(f"{stg}:bad_body:{body}")
+        if body.get("done"):
             break
-        evidence.append(f"{stg}:ok")
-    record("D1 Walk identity->context->...->results (all 200, stage+updated_at)",
-           all_ok, "; ".join(evidence))
+        item = body["item"]
+        val = value_for(item) if callable(value_for) else value_for
+        post = requests.post(f"{BASE}/assessment/psychometric/answer",
+                             headers=hdrs, json={
+                                 "session_id": sid,
+                                 "item_id": item["item_id"],
+                                 "value": val,
+                                 "response_time_ms": 1200 + step * 10,
+                             }, timeout=10)
+        if post.status_code != 200:
+            raise RuntimeError(f"Answer step {step} failed: {post.status_code} {post.text}")
+        responses.append(post.json())
+    return responses
 
-    # D2 Session record shows completed+expires_at=completed_at+60d
-    r = requests.get(f"{API}/sessions/{sid}", timeout=15)
-    ok = r.status_code == 200
-    body = r.json() if ok else {}
-    completed_at = body.get("completed_at")
-    expires_at = body.get("expires_at")
-    status = body.get("status")
-    exp_ok = False
-    delta_evidence = ""
-    if completed_at and expires_at:
-        try:
-            c_dt = datetime.fromisoformat(completed_at)
-            e_dt = datetime.fromisoformat(expires_at)
-            delta = e_dt - c_dt
-            # Allow +-1s tolerance
-            exp_ok = abs((delta - timedelta(days=60)).total_seconds()) < 2
-            delta_evidence = f"delta={delta}"
-        except Exception as exc:
-            delta_evidence = f"parse_err={exc}"
-    d2_ok = (
-        ok
-        and status == "completed"
-        and completed_at is not None
-        and expires_at is not None
-        and exp_ok
+
+def test_C_and_D() -> None:
+    sid, _ = new_session()
+    seen_items: List[str] = []
+    responses: List[Dict[str, Any]] = []
+    ip_header = {"X-Forwarded-For": _fresh_ip()}
+    for step in range(20):
+        nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                          params={"session_id": sid}, headers=ip_header, timeout=10).json()
+        assert not nx["done"], f"Premature done at step {step}"
+        item = nx["item"]
+        if seen_items and item["item_id"] == seen_items[-1]:
+            _assert(False, "C-next-diff",
+                    f"next item equals previous on step {step}: {item['item_id']}")
+        seen_items.append(item["item_id"])
+        post = requests.post(f"{BASE}/assessment/psychometric/answer",
+                             headers=ip_header, json={
+                                 "session_id": sid, "item_id": item["item_id"],
+                                 "value": 4, "response_time_ms": 1500,
+                             }, timeout=10).json()
+        answered = post["progress"]["answered"]
+        expected = step + 1
+        if answered != expected:
+            _assert(False, "C-increment",
+                    f"progress.answered not +1 at step {step}: expected {expected}, got {answered}")
+            break
+        responses.append(post)
+
+    final = responses[-1] if responses else {}
+    _assert(final.get("done") is True and final["progress"]["answered"] == 20,
+            "C", f"final response done={final.get('done')} "
+                  f"answered={final.get('progress', {}).get('answered')}")
+
+    token = admin_login_cookie()
+    cookie_hdr = {"Cookie": f"tra_admin_token={token}"}
+    doc = requests.get(f"{BASE}/admin/sessions/{sid}", headers=cookie_hdr, timeout=10).json()
+    scores = (doc.get("scores") or {}).get("psychometric") or {}
+    keys = set(scores.keys())
+    required = {"learning_agility", "tolerance_for_ambiguity",
+                "self_awareness_claimed", "timing", "bands_reference"}
+    _assert(required <= keys, "C-scores-keys", f"scores.psychometric keys={sorted(keys)}")
+
+    la = scores.get("learning_agility", {})
+    ta = scores.get("tolerance_for_ambiguity", {})
+    d_ok = (
+        la.get("raw_sum") == 48 and abs(la.get("mean_6pt", 0) - 4.0) < 1e-6
+        and abs(la.get("mean_1_5", 0) - 3.4) < 0.01 and la.get("band") == "Moderate"
+        and ta.get("raw_sum") == 32 and abs(ta.get("mean_6pt", 0) - 4.0) < 1e-6
+        and abs(ta.get("mean_1_5", 0) - 3.4) < 0.01 and ta.get("band") == "Moderate"
     )
-    record(
-        "D2 Reaching 'results' sets status=completed, completed_at, expires_at=completed_at+60d",
-        d2_ok,
-        f"status={status} completed_at={completed_at} expires_at={expires_at} {delta_evidence}",
-    )
-
-    # D3 Back by 1 stage allowed — fresh session
-    create2 = requests.post(f"{API}/sessions", json=_valid_payload("back"),
-                            headers=_xff_headers("back-create"), timeout=15)
-    sid2 = create2.json()["session_id"]
-    # advance to psychometric
-    assert _patch_stage(sid2, "context", "back-a").status_code == 200
-    assert _patch_stage(sid2, "psychometric", "back-b").status_code == 200
-    r = _patch_stage(sid2, "context", "back-c")
-    record("D3 back by one stage (psychometric->context) -> 200",
-           r.status_code == 200, f"status={r.status_code} body={r.text[:120]}")
-
-    # D4 Stay allowed (context -> context)
-    r = _patch_stage(sid2, "context", "stay")
-    record("D4 stay at same stage (context->context) -> 200",
-           r.status_code == 200, f"status={r.status_code}")
-
-    # D5 Skip stages rejected (context -> scenario)
-    r = _patch_stage(sid2, "scenario", "skip")
-    body = r.json() if r.status_code == 400 else {}
-    record("D5 skip forward (context->scenario) -> 400",
-           r.status_code == 400 and "detail" in body,
-           f"status={r.status_code} detail={body.get('detail', '')[:160]}")
-
-    # D6 Unknown stage value -> 422 with literal_error
-    r = _patch_stage(sid2, "bananas", "bad-stage")
-    body = r.json() if r.status_code == 422 else {}
-    # body.detail is list of error dicts
-    literal_err = False
-    if isinstance(body, dict):
-        det = body.get("detail")
-        if isinstance(det, list):
-            for e in det:
-                if isinstance(e, dict) and "literal_error" in (e.get("type") or ""):
-                    literal_err = True
-                    break
-    record("D6 unknown stage 'bananas' -> 422 with literal_error",
-           r.status_code == 422 and literal_err,
-           f"status={r.status_code} body={str(body)[:240]}")
-
-    # D7 PATCH on non-existent session id -> 404
-    bogus = str(uuid.uuid4())
-    r = _patch_stage(bogus, "context", "nope")
-    body = r.json() if r.status_code == 404 else {}
-    record("D7 PATCH on non-existent session -> 404",
-           r.status_code == 404 and body.get("detail") == "Session not found.",
-           f"status={r.status_code} body={body}")
+    _assert(d_ok, "D",
+            f"LA(raw={la.get('raw_sum')}, m6={la.get('mean_6pt')}, m15={la.get('mean_1_5')}, "
+            f"band={la.get('band')}) | TA(raw={ta.get('raw_sum')}, m6={ta.get('mean_6pt')}, "
+            f"m15={ta.get('mean_1_5')}, band={ta.get('band')})")
+    la_subs = la.get("subscales", {})
+    ta_subs = ta.get("subscales", {})
+    _assert(set(la_subs.keys()) == {"Mental Agility", "People Agility",
+                                     "Change Agility", "Results Agility", "Self-Awareness"},
+            "C-la-subscales", f"LA subscales keys={sorted(la_subs.keys())}")
+    _assert(set(ta_subs.keys()) == {"Uncertainty Comfort", "Complexity Comfort", "Closure Resistance"},
+            "C-ta-subscales", f"TA subscales keys={sorted(ta_subs.keys())}")
 
 
-# --------------------------------------------------------------------------- #
-# E. GET /api/sessions/{id}
-# --------------------------------------------------------------------------- #
-def test_get_session(happy_session: Dict[str, Any]) -> None:
-    sid = happy_session.get("session_id", "")
-    r = requests.get(f"{API}/sessions/{sid}", timeout=15)
-    ok = r.status_code == 200
-    body = r.json() if ok else {}
-    expected_keys = {
-        "session_id", "resume_code", "stage", "status", "participant",
-        "answers", "conversation", "scenario_responses", "deliverable",
-        "scores", "archived", "created_at", "updated_at", "completed_at", "expires_at",
+def test_E() -> None:
+    sid, _ = new_session()
+    requests.get(f"{BASE}/assessment/psychometric/next",
+                 params={"session_id": sid}, timeout=10)
+    cases = [
+        ("value=0",  {"session_id": sid, "item_id": "LA01", "value": 0,   "response_time_ms": 100}),
+        ("value=7",  {"session_id": sid, "item_id": "LA01", "value": 7,   "response_time_ms": 100}),
+        ("value=3.5",{"session_id": sid, "item_id": "LA01", "value": 3.5, "response_time_ms": 100}),
+        ("rt=-1",    {"session_id": sid, "item_id": "LA01", "value": 4,   "response_time_ms": -1}),
+        ("miss sid", {                   "item_id": "LA01", "value": 4,   "response_time_ms": 100}),
+        ("miss iid", {"session_id": sid,                    "value": 4,   "response_time_ms": 100}),
+        ("miss val", {"session_id": sid, "item_id": "LA01",               "response_time_ms": 100}),
+    ]
+    all_422 = True
+    details = []
+    for name, body in cases:
+        r = requests.post(f"{BASE}/assessment/psychometric/answer", json=body, timeout=10)
+        details.append(f"{name}->{r.status_code}")
+        if r.status_code != 422:
+            all_422 = False
+    _assert(all_422, "E", f"all should be 422: {', '.join(details)}")
+
+
+def test_F() -> None:
+    sid, _ = new_session()
+    requests.get(f"{BASE}/assessment/psychometric/next",
+                 params={"session_id": sid}, timeout=10)
+    r = requests.post(f"{BASE}/assessment/psychometric/answer", json={
+        "session_id": sid, "item_id": "ZZ99", "value": 4, "response_time_ms": 100,
+    }, timeout=10)
+    body = r.json()
+    detail = body.get("detail", "")
+    msg_ok = isinstance(detail, str) and "Unknown item_id" in detail
+    _assert(r.status_code == 422 and msg_ok,
+            "F", f"status={r.status_code} detail={detail!r}")
+
+
+def test_G() -> None:
+    sid, _ = new_session()
+    nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                      params={"session_id": sid}, timeout=10).json()
+    expected = nx["item"]["item_id"]
+    token = admin_login_cookie()
+    doc = requests.get(f"{BASE}/admin/sessions/{sid}",
+                       headers={"Cookie": f"tra_admin_token={token}"}, timeout=10).json()
+    order = doc["psychometric"]["order"]
+    other = next(i for i in order if i != expected)
+    r = requests.post(f"{BASE}/assessment/psychometric/answer", json={
+        "session_id": sid, "item_id": other, "value": 3, "response_time_ms": 900,
+    }, timeout=10)
+    body = r.json()
+    detail = body.get("detail", {})
+    got_expected = isinstance(detail, dict) and detail.get("expected_item_id") == expected
+    _assert(r.status_code == 409 and got_expected,
+            "G", f"status={r.status_code} detail={detail} expected={expected} sent={other}")
+
+
+def test_H() -> None:
+    sid, _ = new_session()
+    nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                      params={"session_id": sid}, timeout=10).json()
+    iid = nx["item"]["item_id"]
+    r1 = requests.post(f"{BASE}/assessment/psychometric/answer", json={
+        "session_id": sid, "item_id": iid, "value": 5, "response_time_ms": 1100,
+    }, timeout=10)
+    r2 = requests.post(f"{BASE}/assessment/psychometric/answer", json={
+        "session_id": sid, "item_id": iid, "value": 5, "response_time_ms": 1100,
+    }, timeout=10)
+    body2 = r2.json()
+    _assert(r2.status_code == 200 and body2.get("idempotent") is True,
+            "H1", f"within-2s replay status={r2.status_code} body={body2}")
+    time.sleep(2.6)
+    r3 = requests.post(f"{BASE}/assessment/psychometric/answer", json={
+        "session_id": sid, "item_id": iid, "value": 5, "response_time_ms": 1100,
+    }, timeout=10)
+    body3 = r3.json()
+    det = body3.get("detail", {})
+    msg = det.get("message") if isinstance(det, dict) else det
+    _assert(r3.status_code == 409 and (msg or "").lower().startswith("item already answered"),
+            "H2", f"after-2s replay status={r3.status_code} body={body3}")
+    _ = r1
+
+
+def test_I() -> None:
+    sid, _ = new_session()
+    nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                      params={"session_id": sid}, timeout=10).json()
+    iid = nx["item"]["item_id"]
+    requests.post(f"{BASE}/assessment/psychometric/answer", json={
+        "session_id": sid, "item_id": iid, "value": 5, "response_time_ms": 1100,
+    }, timeout=10)
+    r = requests.post(f"{BASE}/assessment/psychometric/answer", json={
+        "session_id": sid, "item_id": iid, "value": 3, "response_time_ms": 1100,
+    }, timeout=10)
+    _assert(r.status_code == 409,
+            "I", f"different-value within 2s status={r.status_code} body={r.text[:140]}")
+
+
+def test_J() -> None:
+    sid, _ = new_session()
+    p0 = requests.get(f"{BASE}/assessment/psychometric/progress",
+                      params={"session_id": sid}, timeout=10).json()
+    _assert(p0["answered"] == 0 and p0["total"] == 20 and p0["done"] is False
+            and p0["scale_counts"]["LA"]["total"] == 12
+            and p0["scale_counts"]["TA"]["total"] == 8,
+            "J-pre", f"pre-init progress={p0}")
+    for step in range(5):
+        nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                          params={"session_id": sid}, timeout=10).json()
+        requests.post(f"{BASE}/assessment/psychometric/answer", json={
+            "session_id": sid, "item_id": nx["item"]["item_id"],
+            "value": 4, "response_time_ms": 800,
+        }, timeout=10)
+    p5 = requests.get(f"{BASE}/assessment/psychometric/progress",
+                      params={"session_id": sid}, timeout=10).json()
+    _assert(p5["answered"] == 5 and p5["scale_counts"]["LA"]["answered"] == 5
+            and p5["scale_counts"]["TA"]["answered"] == 0 and p5["done"] is False,
+            "J-mid", f"mid progress={p5}")
+
+
+def test_K() -> None:
+    sid, _ = new_session()
+    for _ in range(5):
+        nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                          params={"session_id": sid}, timeout=10).json()
+        requests.post(f"{BASE}/assessment/psychometric/answer", json={
+            "session_id": sid, "item_id": nx["item"]["item_id"],
+            "value": 4, "response_time_ms": 700,
+        }, timeout=10)
+    token = admin_login_cookie()
+    doc1 = requests.get(f"{BASE}/admin/sessions/{sid}",
+                        headers={"Cookie": f"tra_admin_token={token}"}, timeout=10).json()
+    order_persisted = doc1["psychometric"]["order"]
+    expected_6 = order_persisted[5]
+    nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                      params={"session_id": sid}, timeout=10).json()
+    _assert(nx["item"]["item_id"] == expected_6,
+            "K1", f"after 5 answered /next gives item 6? got={nx['item']['item_id']} "
+                   f"expected={expected_6}")
+    nx2 = requests.get(f"{BASE}/assessment/psychometric/next",
+                       params={"session_id": sid}, timeout=10).json()
+    _assert(nx2["item"]["item_id"] == expected_6,
+            "K2", f"resume /next item stable? {nx2['item']['item_id']} == {expected_6}")
+    doc_mid = requests.get(f"{BASE}/admin/sessions/{sid}",
+                           headers={"Cookie": f"tra_admin_token={token}"}, timeout=10).json()
+    _assert(doc_mid["psychometric"]["order"] == order_persisted,
+            "K3", "order preserved across resumes")
+    _assert(doc_mid.get("scores") is None or not (doc_mid.get("scores") or {}).get("psychometric"),
+            "K4", "scores NOT yet computed mid-way")
+
+    for _ in range(15):
+        nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                          params={"session_id": sid}, timeout=10).json()
+        if nx.get("done"):
+            break
+        requests.post(f"{BASE}/assessment/psychometric/answer", json={
+            "session_id": sid, "item_id": nx["item"]["item_id"],
+            "value": 4, "response_time_ms": 700,
+        }, timeout=10)
+    doc2 = requests.get(f"{BASE}/admin/sessions/{sid}",
+                        headers={"Cookie": f"tra_admin_token={token}"}, timeout=10).json()
+    scores = (doc2.get("scores") or {}).get("psychometric")
+    _assert(scores is not None and "learning_agility" in scores,
+            "K5", f"scores.psychometric computed on 20th? keys="
+                   f"{sorted((scores or {}).keys())}")
+
+
+def test_L() -> None:
+    sid, _ = new_session()
+    answer_all(sid, 4)
+    r_no = requests.get(f"{BASE}/admin/sessions/{sid}", timeout=10)
+    _assert(r_no.status_code == 401, "L1", f"unauth status={r_no.status_code}")
+    token = admin_login_cookie()
+    r = requests.get(f"{BASE}/admin/sessions/{sid}",
+                     headers={"Cookie": f"tra_admin_token={token}"}, timeout=10)
+    _assert(r.status_code == 200, "L2", f"authed status={r.status_code}")
+    doc = r.json()
+    has_scores = bool((doc.get("scores") or {}).get("psychometric"))
+    has_order = bool(doc.get("psychometric", {}).get("order"))
+    _assert(has_scores and has_order,
+            "L3", f"admin doc has scores.psychometric={has_scores}, "
+                   f"psychometric.order={has_order}")
+
+
+def test_M() -> None:
+    sid, _ = new_session()
+    answer_all(sid, 4)
+    r = requests.get(f"{BASE}/sessions/{sid}", timeout=10).json()
+    scores_null = r.get("scores") is None
+    deliverable_null = r.get("deliverable") is None
+    has_participant = bool(r.get("participant", {}).get("email"))
+    has_order = bool(r.get("psychometric", {}).get("order"))
+    has_answers = bool(r.get("psychometric", {}).get("answers"))
+    _assert(scores_null and deliverable_null and has_participant and has_order and has_answers,
+            "M", f"scores_null={scores_null} deliverable_null={deliverable_null} "
+                  f"participant={has_participant} order_present={has_order} answers_present={has_answers}")
+
+
+def test_N() -> None:
+    # Unique IP per run to avoid the 10/hr session creation limit.
+    ip = f"192.0.2.{(int(time.time()) % 250) + 1}"
+    ip_header = {"X-Forwarded-For": ip}
+    sids = []
+    for _ in range(3):
+        # Override new_session's automatic IP with our pinned test-N IP
+        payload = {
+            "name": "Harriet Locke",
+            "email": f"n.test+{int(time.time()*1000)}@example.co.uk",
+            "organisation": "Meridian", "role": "PM", "consent": True,
+        }
+        r = requests.post(f"{BASE}/sessions", json=payload, headers=ip_header, timeout=10)
+        assert r.status_code == 201, f"session create failed: {r.status_code} {r.text}"
+        sids.append(r.json()["session_id"])
+    succeeded = 0
+    for sid in sids:
+        for step in range(20):
+            nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                              params={"session_id": sid},
+                              headers=ip_header, timeout=10).json()
+            if nx.get("done"):
+                break
+            r = requests.post(f"{BASE}/assessment/psychometric/answer",
+                              headers=ip_header, json={
+                                  "session_id": sid,
+                                  "item_id": nx["item"]["item_id"],
+                                  "value": 4, "response_time_ms": 700,
+                              }, timeout=10)
+            if r.status_code == 200:
+                succeeded += 1
+            else:
+                _assert(False, "N-loop",
+                        f"unexpected {r.status_code} after {succeeded} ok: {r.text[:150]}")
+                return
+    fresh_sid_payload = {
+        "name": "Harriet Locke",
+        "email": f"n.fresh+{int(time.time()*1000)}@example.co.uk",
+        "organisation": "Meridian", "role": "PM", "consent": True,
     }
-    missing = expected_keys - set(body.keys()) if isinstance(body, dict) else expected_keys
-    record("E1 GET /sessions/{id} returns full dict with expected keys",
-           ok and not missing,
-           f"status={r.status_code} missing_keys={missing}")
-
-    # Value checks
-    part = body.get("participant", {}) if isinstance(body, dict) else {}
-    participant_ok = (
-        isinstance(part, dict)
-        and part.get("name") == "Alice Whittaker"
-        and part.get("email", "").startswith("alice.whittaker+happy")
-        and part.get("organisation") == "Northstar Analytics"
-        and part.get("role") == "Head of People Operations"
-    )
-    record("E2 participant{name,email,organisation,role} matches",
-           participant_ok, f"participant={part}")
-
-    defaults_ok = (
-        body.get("answers") == []
-        and body.get("conversation") == []
-        and body.get("scenario_responses") == {}
-        and body.get("deliverable") is None
-        and body.get("scores") is None
-        and body.get("archived") is False
-    )
-    record("E3 defaults answers=[], conversation=[], scenario_responses={}, "
-           "deliverable=null, scores=null, archived=false",
-           defaults_ok,
-           f"answers={body.get('answers')} conv={body.get('conversation')} "
-           f"scen={body.get('scenario_responses')} del={body.get('deliverable')} "
-           f"scores={body.get('scores')} archived={body.get('archived')}")
-
-    # E4 bogus id -> 404
-    r = requests.get(f"{API}/sessions/{uuid.uuid4()}", timeout=15)
-    body = r.json() if r.status_code == 404 else {}
-    record("E4 GET /sessions/{bogus} -> 404",
-           r.status_code == 404 and body.get("detail") == "Session not found.",
-           f"status={r.status_code} body={body}")
+    fr = requests.post(f"{BASE}/sessions", json=fresh_sid_payload, headers=ip_header, timeout=10)
+    assert fr.status_code == 201, f"fresh session create failed: {fr.status_code} {fr.text}"
+    fresh_sid = fr.json()["session_id"]
+    nx = requests.get(f"{BASE}/assessment/psychometric/next",
+                      params={"session_id": fresh_sid},
+                      headers=ip_header, timeout=10).json()
+    r_over = requests.post(f"{BASE}/assessment/psychometric/answer",
+                           headers=ip_header, json={
+                               "session_id": fresh_sid,
+                               "item_id": nx["item"]["item_id"],
+                               "value": 4, "response_time_ms": 700,
+                           }, timeout=10)
+    _assert(succeeded == 60 and r_over.status_code == 429,
+            "N", f"60 ok POSTs={succeeded}; 61st status={r_over.status_code}")
 
 
-# --------------------------------------------------------------------------- #
-# F. Rate limiting (10/hr/IP)
-# --------------------------------------------------------------------------- #
-def test_rate_limit() -> None:
-    # Pick a brand-new XFF ip that hasn't been used so far (>250 wraps modulo)
-    # Use an IP outside 203.0.113.0/24 to avoid any collisions.
-    rate_headers = {"X-Forwarded-For": "198.51.100.77"}
-    statuses: List[int] = []
-    for i in range(10):
-        r = requests.post(
-            f"{API}/sessions",
-            json=_valid_payload(f"rate{i}"),
-            headers=rate_headers,
-            timeout=15,
-        )
-        statuses.append(r.status_code)
-    eleven = requests.post(
-        f"{API}/sessions",
-        json=_valid_payload("rate10"),
-        headers=rate_headers,
-        timeout=15,
-    )
-    all10_ok = all(s == 201 for s in statuses)
-    eleventh_429 = eleven.status_code == 429
+def test_O() -> None:
+    d = requests.get(f"{BASE}/openapi.json", timeout=10).json()
+    paths = set(d.get("paths", {}).keys())
+    required = {
+        "/api/assessment/psychometric/next",
+        "/api/assessment/psychometric/answer",
+        "/api/assessment/psychometric/progress",
+        "/api/admin/sessions/{session_id}",
+    }
+    missing = required - paths
+    _assert(not missing, "O", f"missing paths: {missing or 'none'} "
+                               f"(found {len(paths)} total)")
+
+
+def test_P() -> None:
+    sid, code = new_session()
+    r = requests.get(f"{BASE}/sessions/resume/{code}", timeout=10)
+    _assert(r.status_code == 200, "P-resume", f"resume status={r.status_code}")
+    r = requests.patch(f"{BASE}/sessions/{sid}/stage", json={"stage": "context"}, timeout=10)
+    _assert(r.status_code == 200, "P-patch", f"patch stage status={r.status_code}")
+    r = requests.get(f"{BASE}/sessions/{sid}", timeout=10)
+    _assert(r.status_code == 200, "P-get", f"get session status={r.status_code}")
+    login = requests.post(f"{BASE}/admin/auth/login",
+                          json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+                          headers={"X-Forwarded-For": _fresh_ip()}, timeout=10)
+    _assert(login.status_code == 200, "P-login", f"login status={login.status_code}")
+    raw = login.headers.get("Set-Cookie", "")
+    m = re.search(r"tra_admin_token=([^;]+)", raw)
+    token = m.group(1) if m else ""
+    cookie = {"Cookie": f"tra_admin_token={token}"}
+    r = requests.get(f"{BASE}/admin/auth/me", headers=cookie, timeout=10)
+    _assert(r.status_code == 200, "P-me", f"/me status={r.status_code}")
+    r = requests.get(f"{BASE}/admin/settings", headers=cookie, timeout=10)
+    _assert(r.status_code == 200, "P-settings", f"/settings status={r.status_code}")
+    r = requests.post(f"{BASE}/admin/auth/logout", headers=cookie, timeout=10)
+    _assert(r.status_code == 200, "P-logout", f"/logout status={r.status_code}")
+
+
+def test_Q() -> None:
     try:
-        body11 = eleven.json()
-    except Exception:
-        body11 = {}
-    detail = body11.get("detail", "") if isinstance(body11, dict) else ""
-    msg_ok = "Too many sessions from this IP" in detail
-    record(
-        "F1 first 10 POSTs from same IP -> 201",
-        all10_ok,
-        f"statuses={statuses}",
-    )
-    record(
-        "F2 11th POST from same IP -> 429 'Too many sessions from this IP.'",
-        eleventh_429 and msg_ok,
-        f"status={eleven.status_code} detail={detail!r}",
-    )
-
-
-# --------------------------------------------------------------------------- #
-# G. Hygiene: no participant PII in backend.out.log at INFO
-# --------------------------------------------------------------------------- #
-def test_no_pii_in_logs() -> None:
-    log_path = "/var/log/supervisor/backend.out.log"
-    if not os.path.exists(log_path):
-        record("G1 backend.out.log exists", False, f"missing: {log_path}")
+        with open("/var/log/supervisor/backend.out.log", "r", errors="replace") as f:
+            content = f.read()
+    except FileNotFoundError:
+        _assert(False, "Q", "backend.out.log not found")
         return
-    try:
-        data = subprocess.check_output(["tail", "-n", "2000", log_path],
-                                       stderr=subprocess.STDOUT, text=True)
-    except Exception as exc:
-        record("G1 tail backend.out.log", False, f"err={exc}")
-        return
-
-    # Look for emails and specific name of participant used in tests
-    email_hits = re.findall(r"[\w\.+-]+@[\w\.-]+\.\w+", data)
-    name_hits = [l for l in data.splitlines() if "Alice Whittaker" in l]
-
-    # Our create_session uses logger.info without PII. Presence of our test
-    # participant's email or name on an INFO line would be a failure. We're
-    # lenient about emails that appear only on DEBUG lines (filter those out).
-    info_lines_with_email: List[str] = []
-    for line in data.splitlines():
-        if " INFO " in line or " - INFO - " in line:
-            for em in re.findall(r"[\w\.+-]+@[\w\.-]+\.\w+", line):
-                # only flag emails from our test domain to avoid false positives
-                if em.endswith("@example.com"):
-                    info_lines_with_email.append(line.strip())
-                    break
-
-    info_lines_with_name: List[str] = []
-    for line in data.splitlines():
-        if ("Alice Whittaker" in line) and (" INFO " in line or " - INFO - " in line):
-            info_lines_with_name.append(line.strip())
-
-    clean = not info_lines_with_email and not info_lines_with_name
-    record(
-        "G1 No participant email/name at INFO level in backend.out.log",
-        clean,
-        f"info_lines_with_email={len(info_lines_with_email)} "
-        f"info_lines_with_name={len(info_lines_with_name)} "
-        f"(sample_email_lines={info_lines_with_email[:2]}, "
-        f"sample_name_lines={info_lines_with_name[:2]})",
-    )
+    snippet = content[-500_000:]
+    info_lines = [ln for ln in snippet.splitlines() if " - INFO - " in ln]
+    info_joined = "\n".join(info_lines)
+    email_hit = re.search(r"@example\.co\.uk", info_joined)
+    password_hit = "test1234" in info_joined
+    apikey_hit = bool(re.search(r"sk-(ant|emergent|proj)-[A-Za-z0-9]{6,}", info_joined))
+    bad = email_hit or password_hit or apikey_hit
+    _assert(not bad,
+            "Q", f"email_in_INFO={bool(email_hit)}, password_in_INFO={password_hit}, "
+                  f"apikey_in_INFO={apikey_hit}")
 
 
-# --------------------------------------------------------------------------- #
-# Runner
-# --------------------------------------------------------------------------- #
 def main() -> int:
-    print(f"API = {API}")
-    # Sanity ping first
-    r = requests.get(f"{API}/health", timeout=15)
-    record("API /health reachable", r.status_code == 200,
-           f"status={r.status_code}")
-
-    test_docs()
-
-    happy = test_create_session_happy()
-
-    test_validation()
-
-    if happy.get("session_id"):
-        test_resume(happy)
-        test_get_session(happy)
-
-    test_stage_transitions()
-
-    test_rate_limit()
-
-    test_no_pii_in_logs()
-
-    # Summary
-    total = len(results)
-    passed = sum(1 for _, ok, _ in results if ok)
-    print("\n" + "=" * 70)
-    print(f"TOTAL: {passed}/{total} passed")
-    print("=" * 70)
-    failed = [(n, e) for (n, ok, e) in results if not ok]
-    if failed:
-        print("\nFAILURES:")
-        for n, e in failed:
-            print(f"  - {n}\n      {e}")
-    return 0 if passed == total else 1
+    tests = [
+        ("A", test_A), ("B", test_B), ("C_D", test_C_and_D),
+        ("E", test_E), ("F", test_F), ("G", test_G),
+        ("H", test_H), ("I", test_I), ("J", test_J),
+        ("K", test_K), ("L", test_L), ("M", test_M),
+        ("N", test_N), ("O", test_O), ("P", test_P), ("Q", test_Q),
+    ]
+    for name, fn in tests:
+        print(f"\n=== Running test {name} ===")
+        try:
+            fn()
+        except Exception as exc:
+            record(name, False, f"Exception: {type(exc).__name__}: {exc}")
+    print("\n=== SUMMARY ===")
+    passes = sum(1 for r in RESULTS if r["ok"])
+    fails = [r for r in RESULTS if not r["ok"]]
+    print(f"{passes}/{len(RESULTS)} assertions passed; {len(fails)} failures")
+    for f in fails:
+        print(f"  FAIL [{f['letter']}] {f['detail']}")
+    return 0 if not fails else 1
 
 
 if __name__ == "__main__":

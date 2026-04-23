@@ -245,19 +245,145 @@ frontend:
 
 metadata:
   created_by: "main_agent"
-  version: "0.3.0-phase3"
-  test_sequence: 2
+  version: "0.4.0-phase4"
+  test_sequence: 3
   run_ui: false
 
 test_plan:
   current_focus:
-    - "Admin auth (login/logout/me + JWT cookie)"
-    - "Admin settings CRUD with key encryption + masking"
-    - "LLM router cascade + provider test endpoints"
-    - "Regression: Phase 2 session endpoints still pass"
+    - "Psychometric: next/answer/progress endpoints, scoring, admin read"
+    - "Regression: Phase 2 + Phase 3 endpoints still pass"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 4 complete. Added:
+          - `psychometric_service.py` — parses Doc 20 at module import (20 items: 12 LA + 8 TA),
+            validates counts/uniqueness, maps subscales, scores per Doc 20 formulas and bands.
+            Fails loudly if the doc ever grows reverse-keyed items or count mismatches.
+          - 3 new participant endpoints: GET /api/assessment/psychometric/next,
+            POST /api/assessment/psychometric/answer, GET /api/assessment/psychometric/progress.
+          - 1 new admin endpoint: GET /api/admin/sessions/{id} (requires admin JWT).
+          - Public GET /api/sessions/{id} now strips `scores` and `deliverable`.
+          - Per-session randomised item order persisted on first /next, never overwritten.
+          - Append-only answers with strict ordering: out-of-order / already-answered => 409 with
+            expected_item_id. Within-2s duplicate same-value = 200 idempotent. Unknown item_id = 422.
+          - Answer rate limit: 60/min/IP.
+          - On the 20th answer, server computes scores.psychometric (raw_sum, mean_6pt, mean_1_5,
+            band, subscales, timing, self_awareness_claimed). Never exposed on participant endpoints.
+          - 23/23 unit tests pass (11 psychometric + 12 existing LLM router).
+        Frontend:
+          - Real /assessment/psychometric page replaces placeholder. Intro panel (first-time only;
+            resumers skip it), then per-item screen: progress bar, scale chip, serif item text,
+            6-card Likert row with numerals + labels. Auto-advance ~450ms after selection.
+            Keyboard 1-6 to select+advance, arrows ← → preview, Enter = submit selected.
+            Response-time timer pauses when tab hidden >5s. Save & exit header button still present.
+            Retry-on-409 reconciles by re-fetching /next.
+          - Done panel with gold check + "Continue" to advance stage to ai-discussion.
+
+        Please run a thorough backend sweep of the new endpoints plus regression of Phase 2+3 endpoints.
+        Use http://localhost:8001 (same as Phase 3 test).
+
+backend:
+  - task: "Psychometric endpoints + scoring + admin session read (Phase 4)"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/psychometric_service.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            End-to-end manually verified: 20-answer scripted loop (bash) completes with
+            session.psychometric.order = 20 items (LA block then TA block, shuffled within each)
+            and session.scores.psychometric populated. Admin GET /api/admin/sessions/{id} returns
+            scores; public GET /api/sessions/{id} returns scores=null. Edge cases covered:
+            bad value (0/7/decimal) -> 422; unknown item_id -> 422; out-of-order post -> 409;
+            replay within 2s same value -> 200 idempotent; replay after 2s -> 409 already-answered.
+            Playwright E2E: 20 answers via keyboard, intro panel shown first run, skipped on
+            resume, completion panel advances stage, resume lands on next unanswered item.
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 4 backend verification complete. Ran /app/backend_test.py against
+            http://localhost:8001/api. 39/39 assertions passed across letters A-Q.
+              A. POST /sessions then GET /assessment/psychometric/next (first call):
+                 200 with {done:false, item:{item_id,text,scale,subscale}, progress:{answered:0,
+                 total:20, current_index_1based:1, done:false, scale_counts:{LA:{0,12}, TA:{0,8}}}}.
+                 Admin read confirms: session.psychometric.order has 20 IDs with first 12 all
+                 LA* (e.g. ['LA04','LA02','LA11',...]) and last 8 all TA* (e.g. [...,'TA04',
+                 'TA08','TA06']); session.stage flipped to 'psychometric';
+                 psychometric.started_at populated with UTC ISO timestamp.
+              B. Two consecutive GET /next for the same session return the same item_id
+                 (idempotent initialisation — no re-shuffle, same head of queue).
+              C. 20 sequential POSTs: progress.answered increments exactly 0->1->...->20, the
+                 next item served always differs from the previous, the 20th response has
+                 {done:true, progress.answered:20}. Subsequent admin read shows
+                 scores.psychometric with keys {learning_agility, tolerance_for_ambiguity,
+                 self_awareness_claimed, timing, bands_reference}, plus all five LA subscales
+                 (Change/Mental/People/Results/Self-Awareness) and all three TA subscales
+                 (Uncertainty/Complexity/Closure).
+              D. Score math sanity with all value=4: LA raw_sum=48, mean_6pt=4.0, mean_1_5=3.4,
+                 band='Moderate'. TA raw_sum=32, mean_6pt=4.0, mean_1_5=3.4, band='Moderate'.
+                 Matches Doc 20 formulas exactly.
+              E. Validation rejections all 422 (no 500s): value=0 -> 422; value=7 -> 422;
+                 value=3.5 -> 422; response_time_ms=-1 -> 422; missing session_id -> 422;
+                 missing item_id -> 422; missing value -> 422.
+              F. POST with item_id='ZZ99' -> 422 {"detail": "Unknown item_id 'ZZ99'."}. Exact.
+              G. Out-of-order POST: expected LA05, sent LA09 -> 409 with detail
+                 {message: 'Out-of-order answer.', expected_item_id: 'LA05',
+                 received_item_id: 'LA09'}.
+              H. Replay within 2s with same item_id+value -> 200 {idempotent:true} with
+                 unchanged progress. After 2.6s, same payload -> 409 with detail.message
+                 'Item already answered.'.
+              I. Within 2s, same item_id but DIFFERENT value -> 409 (not idempotent).
+              J. GET /progress works pre-init (answered:0, total:20, done:false,
+                 scale_counts.LA.total:12, scale_counts.TA.total:8) and mid-flight after 5
+                 LA answers (answered:5, LA.answered:5, TA.answered:0).
+              K. Resume behaviour: after 5 answers, order is persisted and GET /next returns
+                 order[5] (the 6th item). Calling GET /next again (simulated resume) returns
+                 the same id and the persisted order array is byte-identical (no reshuffle).
+                 scores.psychometric stays absent until the 20th POST, then appears once with
+                 all expected keys.
+              L. Admin GET /api/admin/sessions/{id}: unauth -> 401 "Not authenticated."; with
+                 valid JWT cookie -> 200 returning the full session with scores.psychometric
+                 AND psychometric.order both present.
+              M. Public GET /api/sessions/{id}: scores=null, deliverable=null, but
+                 participant{name,email,organisation,role}, psychometric.order (20 IDs) and
+                 psychometric.answers (populated) are still present — frontend can track
+                 progress without seeing scores.
+              N. Rate limit: 60 POST /answer requests in a minute from the same X-Forwarded-For
+                 IP all succeeded; the 61st returned 429 "Too many answers. Please slow down."
+              O. OpenAPI /api/openapi.json lists all 4 new paths:
+                 /api/assessment/psychometric/next, /api/assessment/psychometric/answer,
+                 /api/assessment/psychometric/progress, /api/admin/sessions/{session_id}.
+                 Total 16 /api/* paths enumerated.
+              P. Regression — Phase 2+3 endpoints still return the expected codes:
+                 POST /api/sessions 201, GET /api/sessions/resume/{code} 200, PATCH
+                 /api/sessions/{id}/stage 200, GET /api/sessions/{id} 200, POST
+                 /api/admin/auth/login 200, GET /api/admin/auth/me 200, GET /api/admin/settings
+                 200, POST /api/admin/auth/logout 200.
+              Q. Security log hygiene: tail of /var/log/supervisor/backend.out.log shows NO
+                 INFO-level lines containing @example.co.uk (test email), no occurrences of
+                 password 'test1234', and no API-key-shaped strings (sk-ant-*, sk-emergent-*,
+                 sk-proj-*).
+
+            Harness notes (test-side, not server-side): a fresh X-Forwarded-For IP is used per
+            session creation to avoid the documented 10/hr POST /sessions per-IP rate limit
+            across the 16-test sweep; the admin JWT is cached once to avoid the 10/15min login
+            limit. Cookie is correctly marked Secure, so requests.Session cannot replay it
+            over http://localhost — harness explicitly extracts the JWT and sends it via an
+            explicit Cookie header. Real browsers on the HTTPS preview URL replay the cookie
+            automatically — this is a test-harness workaround, not a server bug.
+
+            No code changes were made during testing. No 500s observed. No secret leaks.
+            All Phase 4 backend tasks are green. Main agent can summarise and close Phase 4.
+
 
 agent_communication:
     - agent: "main"

@@ -44,6 +44,7 @@ from services.llm_router import (
     LLMRouterError,
     categorise_exception,
 )
+import psychometric_service
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -93,8 +94,11 @@ RATE_LIMIT_SESSIONS_MAX = 10
 RATE_LIMIT_SESSIONS_WINDOW = 60 * 60  # 1 hour
 RATE_LIMIT_LOGIN_MAX = 10
 RATE_LIMIT_LOGIN_WINDOW = 15 * 60  # 15 min
+RATE_LIMIT_ANSWER_MAX = 60
+RATE_LIMIT_ANSWER_WINDOW = 60  # per minute
 _sessions_ip_hits: Dict[str, deque] = defaultdict(deque)
 _login_ip_hits: Dict[str, deque] = defaultdict(deque)
+_answer_ip_hits: Dict[str, deque] = defaultdict(deque)
 
 
 def _rate_limit_check(bucket: Dict[str, deque], ip: str, max_hits: int, window_sec: int) -> bool:
@@ -190,6 +194,7 @@ class SessionResumeOut(BaseModel):
 
 
 class SessionOut(BaseModel):
+    model_config = ConfigDict(extra="allow")  # tolerate future Phase fields
     session_id: str
     resume_code: str
     stage: str
@@ -205,6 +210,7 @@ class SessionOut(BaseModel):
     updated_at: str
     completed_at: Optional[str]
     expires_at: Optional[str]
+    psychometric: Optional[Dict[str, Any]] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -344,12 +350,214 @@ async def update_stage(session_id: str, payload: SessionStageUpdateIn):
 
 
 @api_router.get("/sessions/{session_id}", response_model=SessionOut,
-                summary="Get the current state of a session")
+                summary="Get the current state of a session (participant-safe; no scores)")
 async def get_session(session_id: str):
     doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Session not found.")
+    # Participant-safe: never expose scores or the deliverable.
+    doc["scores"] = None
+    doc["deliverable"] = None
     return SessionOut(**doc)
+
+
+# --------------------------------------------------------------------------- #
+# Routes — psychometric assessment (Phase 4)
+# --------------------------------------------------------------------------- #
+class PsychometricAnswerIn(BaseModel):
+    session_id: str
+    item_id: str
+    value: int = Field(..., ge=1, le=6)
+    response_time_ms: int = Field(..., ge=0)
+
+
+def _next_expected_item(order: List[str], answered_ids: List[str]) -> Optional[str]:
+    """First item in order that has not yet been answered."""
+    answered_set = set(answered_ids)
+    for iid in order:
+        if iid not in answered_set:
+            return iid
+    return None
+
+
+def _progress(order: List[str], answered_ids: List[str]) -> Dict[str, Any]:
+    answered = len(answered_ids)
+    total = len(order) if order else 20
+    # current_index is 1-based position of the next unanswered item (capped to total)
+    idx = min(answered + 1, total) if answered < total else total
+    # Scale counts
+    la_total = 12
+    ta_total = 8
+    la_answered = sum(1 for i in answered_ids if i.startswith("LA"))
+    ta_answered = sum(1 for i in answered_ids if i.startswith("TA"))
+    return {
+        "answered": answered,
+        "total": total,
+        "current_index_1based": idx,
+        "done": answered >= total,
+        "scale_counts": {
+            "LA": {"answered": la_answered, "total": la_total},
+            "TA": {"answered": ta_answered, "total": ta_total},
+        },
+    }
+
+
+async def _ensure_psychometric_initialised(session_id: str) -> Dict[str, Any]:
+    """Ensure session.psychometric has `order` and `started_at`.
+    Idempotent: if already initialised, returns the existing doc.
+    """
+    doc = await sessions_coll.find_one({"session_id": session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    psych = doc.get("psychometric") or {}
+    if psych.get("order"):
+        return doc
+    order = psychometric_service.randomised_order()
+    now = _now_iso()
+    update = {
+        "psychometric": {
+            "order": order,
+            "answers": [],
+            "started_at": now,
+            "completed_at": None,
+        },
+        "stage": "psychometric",
+        "updated_at": now,
+    }
+    # Don't clobber any older answers array (shouldn't exist at this point).
+    await sessions_coll.update_one({"session_id": session_id}, {"$set": update})
+    doc = await sessions_coll.find_one({"session_id": session_id})
+    logger.info("Psychometric initialised for session=%s", session_id)
+    return doc
+
+
+@api_router.get(
+    "/assessment/psychometric/next",
+    summary="Get the next psychometric item for this session",
+)
+async def psychometric_next(session_id: str):
+    doc = await _ensure_psychometric_initialised(session_id)
+    psych = doc.get("psychometric") or {}
+    order: List[str] = psych.get("order") or []
+    answers = psych.get("answers") or []
+    answered_ids = [a["item_id"] for a in answers]
+    progress = _progress(order, answered_ids)
+    next_id = _next_expected_item(order, answered_ids)
+    if next_id is None:
+        return {"done": True, "progress": progress}
+    item = psychometric_service.get_item(next_id)
+    if not item:
+        raise HTTPException(status_code=500,
+                            detail=f"Internal: item {next_id} missing from catalog.")
+    return {
+        "done": False,
+        "item": item,
+        "progress": progress,
+    }
+
+
+@api_router.get(
+    "/assessment/psychometric/progress",
+    summary="Get psychometric progress for this session",
+)
+async def psychometric_progress(session_id: str):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    psych = doc.get("psychometric") or {}
+    order = psych.get("order") or []
+    answered_ids = [a["item_id"] for a in (psych.get("answers") or [])]
+    return _progress(order, answered_ids)
+
+
+@api_router.post(
+    "/assessment/psychometric/answer",
+    summary="Submit an answer for the current psychometric item",
+)
+async def psychometric_answer(payload: PsychometricAnswerIn, request: Request):
+    ip = _client_ip(request)
+    if not _rate_limit_check(_answer_ip_hits, ip, RATE_LIMIT_ANSWER_MAX, RATE_LIMIT_ANSWER_WINDOW):
+        raise HTTPException(status_code=429, detail="Too many answers. Please slow down.")
+
+    # Validate item_id is known
+    if not psychometric_service.get_item(payload.item_id):
+        raise HTTPException(status_code=422, detail=f"Unknown item_id '{payload.item_id}'.")
+
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    psych = doc.get("psychometric") or {}
+    order: List[str] = psych.get("order") or []
+    if not order:
+        # Client hasn't initialised — do it now (e.g. POST without GET /next first).
+        doc = await _ensure_psychometric_initialised(payload.session_id)
+        psych = doc.get("psychometric") or {}
+        order = psych.get("order") or []
+
+    answers: List[Dict[str, Any]] = psych.get("answers") or []
+    answered_ids = [a["item_id"] for a in answers]
+
+    # Idempotency window: if the last answer was the same item_id within 2s and same value, 200 w/o dupe
+    if answers:
+        last = answers[-1]
+        if last.get("item_id") == payload.item_id and last.get("value") == payload.value:
+            try:
+                last_t = datetime.fromisoformat(last["answered_at"])
+                delta = (datetime.now(timezone.utc) - last_t).total_seconds()
+                if 0 <= delta <= 2.0:
+                    logger.debug("Idempotent duplicate for item=%s within 2s", payload.item_id)
+                    return {
+                        "progress": _progress(order, answered_ids),
+                        "done": _progress(order, answered_ids)["done"],
+                        "idempotent": True,
+                    }
+            except Exception:
+                pass
+
+    # Already answered (no back button) → 409 (unless within idempotency window above)
+    if payload.item_id in answered_ids:
+        raise HTTPException(status_code=409, detail={
+            "message": "Item already answered.",
+            "item_id": payload.item_id,
+        })
+
+    # Out-of-order guard: item_id must match the next expected
+    expected = _next_expected_item(order, answered_ids)
+    if expected != payload.item_id:
+        raise HTTPException(status_code=409, detail={
+            "message": "Out-of-order answer.",
+            "expected_item_id": expected,
+            "received_item_id": payload.item_id,
+        })
+
+    # Append answer
+    now = _now_iso()
+    new_answer = {
+        "item_id": payload.item_id,
+        "value": payload.value,
+        "response_time_ms": payload.response_time_ms,
+        "answered_at": now,
+    }
+    answers.append(new_answer)
+    psych["answers"] = answers
+
+    update: Dict[str, Any] = {
+        "psychometric.answers": answers,
+        "updated_at": now,
+    }
+
+    # If this was the 20th answer, finalise + score
+    if len(answers) >= len(order):
+        update["psychometric.completed_at"] = now
+        # Build a synthetic session doc for scoring (only needs psychometric.answers)
+        score_payload = psychometric_service.score({"psychometric": {"answers": answers}})
+        update["scores"] = {**(doc.get("scores") or {}), "psychometric": score_payload}
+
+    await sessions_coll.update_one({"session_id": payload.session_id}, {"$set": update})
+    progress = _progress(order, [a["item_id"] for a in answers])
+    logger.info("Psychometric answer session=%s item=%s (%d/%d)",
+                payload.session_id, payload.item_id, progress["answered"], progress["total"])
+    return {"progress": progress, "done": progress["done"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -616,6 +824,18 @@ async def test_fallback(current=Depends(require_admin)):
                 "error_category": category, "error": str(exc)[:240],
             },
         )
+
+
+
+# --------------------------------------------------------------------------- #
+# Routes — admin sessions (read only, Phase 4)
+# --------------------------------------------------------------------------- #
+@admin_router.get("/sessions/{session_id}", summary="Get a full session (admin)")
+async def admin_get_session(session_id: str, current=Depends(require_admin)):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return doc
 
 
 # --------------------------------------------------------------------------- #
