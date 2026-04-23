@@ -1,6 +1,7 @@
-import React from 'react';
-import { Link } from 'react-router-dom';
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { ArrowRight, ShieldCheck } from 'lucide-react';
+import { useSession } from '../store/sessionStore';
 
 const items = [
   {
@@ -21,6 +22,28 @@ const items = [
 ];
 
 export default function Context() {
+  const advanceStage = useSession((s) => s.advanceStage);
+  const sessionId = useSession((s) => s.sessionId);
+  const storeError = useSession((s) => s.error);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const navigate = useNavigate();
+
+  async function onContinue() {
+    setBusy(true);
+    setErr(null);
+    try {
+      if (sessionId) {
+        await advanceStage('psychometric');
+      }
+      navigate('/assessment/psychometric');
+    } catch (e) {
+      setErr(e.message || 'Could not continue.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <section className="max-w-content mx-auto px-6 sm:px-8 pt-16 sm:pt-24 pb-20">
       <div className="max-w-3xl">
@@ -57,16 +80,19 @@ export default function Context() {
       <div className="mt-12 bg-mist border-l-2 border-gold p-6 sm:p-7 flex gap-4 items-start">
         <ShieldCheck className="w-5 h-5 text-navy flex-none mt-0.5" strokeWidth={1.75} />
         <p className="text-sm sm:text-[15px] text-ink/80 leading-relaxed">
-          <span className="font-medium text-navy">Privacy.</span> Your responses are used only to
-          generate your personal assessment. No data is retained after your session.
+          <span className="font-medium text-navy">Privacy.</span> Your responses are stored securely and used only for your assessment and authorised review. Sessions are deleted 60&nbsp;days after completion unless flagged for archive.
         </p>
       </div>
 
+      {(err || storeError) && (
+        <p className="mt-6 text-sm text-red-700">{err || storeError}</p>
+      )}
+
       <div className="mt-14">
-        <Link to="/assessment/psychometric" className="btn-primary">
-          Continue
+        <button type="button" onClick={onContinue} disabled={busy} className="btn-primary disabled:opacity-60">
+          {busy ? 'Loading…' : 'Continue'}
           <ArrowRight className="w-4 h-4" strokeWidth={2} />
-        </Link>
+        </button>
       </div>
     </section>
   );

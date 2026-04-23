@@ -1,14 +1,13 @@
 import React from 'react';
 import { useLocation } from 'react-router-dom';
 import { Check } from 'lucide-react';
-import { ASSESSMENT_STAGES } from '../context/AssessmentContext';
 
-const STAGES_WITH_SHORT = [
-  { ...ASSESSMENT_STAGES[0], short: 'Psych.' },
-  { ...ASSESSMENT_STAGES[1], short: 'AI' },
-  { ...ASSESSMENT_STAGES[2], short: 'Scen.' },
-  { ...ASSESSMENT_STAGES[3], short: 'Proc.' },
-  { ...ASSESSMENT_STAGES[4], short: 'Results' },
+const STAGES = [
+  { id: 'psychometric', label: 'Psychometric', short: 'Psych.', path: '/assessment/psychometric' },
+  { id: 'ai-discussion', label: 'AI Discussion', short: 'AI', path: '/assessment/ai-discussion' },
+  { id: 'scenario', label: 'Scenario', short: 'Scen.', path: '/assessment/scenario' },
+  { id: 'processing', label: 'Processing', short: 'Proc.', path: '/assessment/processing' },
+  { id: 'results', label: 'Results', short: 'Results', path: '/assessment/results' },
 ];
 
 function stepState(index, activeIndex) {
@@ -19,27 +18,22 @@ function stepState(index, activeIndex) {
 
 export default function ProgressStepper() {
   const { pathname } = useLocation();
-  const activeIndex = Math.max(
-    0,
-    ASSESSMENT_STAGES.findIndex((s) => s.path === pathname)
-  );
+  const activeIndex = Math.max(0, STAGES.findIndex((s) => s.path === pathname));
 
   return (
     <nav aria-label="Assessment progress" className="w-full">
       <ol className="grid grid-cols-5 items-start gap-0">
-        {STAGES_WITH_SHORT.map((stage, index) => {
+        {STAGES.map((stage, index) => {
           const state = stepState(index, activeIndex);
           const isFirst = index === 0;
-          const isLast = index === STAGES_WITH_SHORT.length - 1;
+          const isLast = index === STAGES.length - 1;
           return (
             <li
               key={stage.id}
               className="flex flex-col items-center min-w-0"
               aria-current={state === 'current' ? 'step' : undefined}
             >
-              {/* Circle row with connectors */}
               <div className="flex items-center w-full">
-                {/* left connector */}
                 <div className="flex-1 h-px">
                   {!isFirst && (
                     <div
@@ -50,7 +44,6 @@ export default function ProgressStepper() {
                     />
                   )}
                 </div>
-                {/* circle */}
                 <div className="flex items-center justify-center flex-none">
                   {state === 'complete' && (
                     <span
@@ -71,7 +64,6 @@ export default function ProgressStepper() {
                     </span>
                   )}
                 </div>
-                {/* right connector */}
                 <div className="flex-1 h-px">
                   {!isLast && (
                     <div
@@ -83,7 +75,6 @@ export default function ProgressStepper() {
                   )}
                 </div>
               </div>
-              {/* Label — short on mobile, full on sm+ */}
               <span
                 className={
                   'mt-3 text-[10px] sm:text-xs tracking-wider2 uppercase text-center leading-tight px-1 ' +

@@ -1,16 +1,48 @@
-import React from 'react';
-import { Link } from 'react-router-dom';
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, ArrowRight } from 'lucide-react';
+import { useSession, STAGE_PATH } from '../../store/sessionStore';
 
 export default function StagePlaceholder({
+  stageKey,
   eyebrow,
   title,
   description,
-  backTo,
+  prevStage,
+  prevPath,
+  nextStage,
+  nextPath,
   backLabel = 'Back',
-  nextTo,
   nextLabel = 'Continue',
 }) {
+  const advanceStage = useSession((s) => s.advanceStage);
+  const sessionId = useSession((s) => s.sessionId);
+  const [busy, setBusy] = useState(null); // 'back' | 'next' | null
+  const [err, setErr] = useState(null);
+  const navigate = useNavigate();
+
+  async function move(direction) {
+    setBusy(direction);
+    setErr(null);
+    try {
+      if (direction === 'back') {
+        if (sessionId && prevStage) {
+          await advanceStage(prevStage);
+        }
+        navigate(prevPath || '/');
+      } else {
+        if (sessionId && nextStage) {
+          await advanceStage(nextStage);
+        }
+        navigate(nextPath || STAGE_PATH[nextStage] || '/');
+      }
+    } catch (e) {
+      setErr(e.message || 'Could not navigate.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <section className="max-w-3xl">
       <span className="eyebrow">{eyebrow}</span>
@@ -28,20 +60,22 @@ export default function StagePlaceholder({
         </p>
       </div>
 
+      {err && <p className="mt-6 text-sm text-red-700">{err}</p>}
+
       <div className="mt-12 flex items-center justify-between gap-4 flex-wrap">
-        {backTo ? (
-          <Link to={backTo} className="btn-ghost" aria-label={backLabel}>
+        {prevPath ? (
+          <button type="button" onClick={() => move('back')} disabled={busy !== null} className="btn-ghost disabled:opacity-50">
             <ArrowLeft className="w-4 h-4" strokeWidth={2} />
             {backLabel}
-          </Link>
+          </button>
         ) : (
           <span />
         )}
-        {nextTo && (
-          <Link to={nextTo} className="btn-primary">
-            {nextLabel}
+        {nextPath && (
+          <button type="button" onClick={() => move('next')} disabled={busy !== null} className="btn-primary disabled:opacity-60">
+            {busy === 'next' ? 'Loading…' : nextLabel}
             <ArrowRight className="w-4 h-4" strokeWidth={2} />
-          </Link>
+          </button>
         )}
       </div>
     </section>

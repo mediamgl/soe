@@ -102,14 +102,13 @@
 #====================================================================================================
 
 user_problem_statement: |
-  Phase 1 of the Transformation Readiness Assessment web app (FARM stack).
-  Goal: build the navigable shell — landing + context pages fully styled, plus five
-  placeholder assessment stages with a 5-step progress indicator. McKinsey/Bain aesthetic
-  (navy #1e3a5f, gold #d4a84b, Playfair Display + Inter, generous whitespace). No methodology
-  logic yet — that is Phase 2+.
+  Phase 2 of the Transformation Readiness Assessment web app. Builds on Phase 1.
+  Goal: (1) ingest methodology content (scan only, don't wire copy yet), (2) capture participant
+  identity at Begin, (3) persist session state in Mongo, (4) implement resume-by-code with
+  a Save & exit affordance and localStorage hydrate. Placeholder stages remain placeholders.
 
 backend:
-  - task: "Scaffold FastAPI backend with /api/health and /api/docs"
+  - task: "Sessions API: POST, GET, PATCH stage, resume"
     implemented: true
     working: true
     file: "backend/server.py"
@@ -120,16 +119,26 @@ backend:
         - working: true
           agent: "main"
           comment: |
-            Created /app/backend/server.py with FastAPI app, MongoDB motor client, CORS, and an /api router.
-            Added GET /api/health returning {status: "ok"}. Exposed FastAPI docs at /api/docs, redoc at
-            /api/redoc, openapi at /api/openapi.json (all under /api/* to match Kubernetes ingress).
-            Verified via curl: /api/health=200, /api/docs=200, /api/openapi.json=200.
+            Full sessions API landed.
+              - POST /api/sessions — EmailStr validation, blank-name rejection, consent=true required,
+                sliding-window rate limit (10/hr/IP), returns {session_id, resume_code, stage:'identity'}.
+              - GET /api/sessions/resume/{code} — normalises to uppercase + inserts dash if missing,
+                returns {session_id, stage, participant} or 404.
+              - PATCH /api/sessions/{id}/stage — Literal-validated stage; rejects out-of-order
+                transitions (only -1/0/+1 allowed) with 400; returns 200 on valid. Sets
+                status='completed', completed_at, and expires_at = completed_at + 60d when stage='results'.
+              - GET /api/sessions/{id} — returns full (non-sensitive) state for rehydration.
+              - Validation errors returned as 422 via custom handler that uses jsonable_encoder
+                so Pydantic ValueErrors serialise correctly.
+              - Mongo indexes created at startup: uniq_resume_code (unique), status_expires (compound).
+              - Logging: session_id is logged at INFO; participant (name/email) only at DEBUG.
+            Verified via 15-point curl smoke test (all pass), plus end-to-end browser flow
+            (create -> advance -> save-exit -> resume -> land at last stage).
 
-frontend:
-  - task: "Phase 1 shell — landing, context, 5 placeholder assessment stages, progress stepper"
+  - task: "Mongo sessions schema & indexes"
     implemented: true
     working: true
-    file: "frontend/src/App.js, frontend/src/pages/*, frontend/src/components/*"
+    file: "backend/server.py"
     stuck_count: 0
     priority: "high"
     needs_retesting: false
@@ -137,24 +146,107 @@ frontend:
         - working: true
           agent: "main"
           comment: |
-            Scaffolded CRA+craco+Tailwind frontend from scratch. Design system: navy #1e3a5f, gold #d4a84b,
-            Playfair Display (serif headings) + Inter (sans-serif body) via Google Fonts.
-            Routes: /, /context, /assessment/{psychometric,ai-discussion,scenario,processing,results}.
-            Progress stepper (5 steps) appears only on /assessment/* routes; hidden on / and /context.
-            Hit one PostCSS issue where Tailwind directives were not being processed — fixed by using
-            craco.config.js with an explicit webpack.configure that injects tailwindcss + autoprefixer
-            into every postcss-loader instance. Verified end-to-end via Playwright screenshots:
-              - Full forward path: / -> /context -> psych -> ai -> scenario -> processing -> results (all links work).
-              - Full back path: results -> processing -> scenario -> ai -> psych -> /context (all links work).
-              - Footer "Demonstration Version • Methodology by Steven Bianchi" present on every page.
-              - Stepper shows correct current/complete/upcoming states.
-              - Mobile 375px: no horizontal scroll (verified via scrollWidth vs clientWidth).
-              - Desktop 1440px: layout matches McKinsey/Bain brief (whitespace, thin gold accents, subtle card borders).
+            sessions collection. Docs use str(uuid.uuid4()) as both _id and session_id
+            (no ObjectIds anywhere). Fields per spec: participant{name,email,organisation,role},
+            consent{accepted,accepted_at}, status, stage, answers[], conversation[],
+            scenario_responses{}, deliverable, scores, archived, created_at, updated_at,
+            completed_at, expires_at. Verified in mongosh: indexes present and correctly typed.
+
+frontend:
+  - task: "Participant capture /start + resume code issuance"
+    implemented: true
+    working: true
+    file: "frontend/src/pages/Start.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            /start form: full name (required, blank trimmed), email (required, validated), organisation
+            (optional), role (optional), consent checkbox (required, verbatim per spec).
+            Client-side errors shown inline; server 422 surfaced via store.error. On successful POST
+            the page flips to a "Save your resume code" card with the XXXX-XXXX code, a Copy button
+            with clipboard + textarea fallback, and a Continue CTA that PATCHes stage='context'
+            before navigating to /context. Email delivery explicitly noted as STUBBED (Resend coming
+            in a later phase).
+
+  - task: "Landing page — Begin + Resume-a-session"
+    implemented: true
+    working: true
+    file: "frontend/src/pages/Landing.js, frontend/src/components/ResumeModal.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Landing now routes Begin Assessment -> /start. Secondary affordance "Resume a session"
+            opens a modal with a code field (auto-uppercase, strips non-alphanumeric chars, max 9
+            incl. dash). On submit the store hydrates via GET /api/sessions/resume/{code} and
+            navigates to STAGE_PATH[stage]. 404 shows "Resume code not found." inline.
+
+  - task: "Save & exit + localStorage hydration"
+    implemented: true
+    working: true
+    file: "frontend/src/components/AssessmentLayout.js, SaveExitButton.js, SaveExitModal.js, store/sessionStore.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Save & exit button rendered top-right inside AssessmentLayout on every /assessment/*.
+            Modal shows the current resumeCode with copy button + "Exit to home" CTA that clears
+            only the in-memory store (leaves Mongo session + localStorage intact) and routes to /.
+            AssessmentLayout hydrates from localStorage on hard reload when store is empty; if no
+            localStorage entry OR GET /api/sessions/{id} 404s, clears storage and redirects to /.
+            localStorage key 'tra_session_v1' stores ONLY sessionId + resumeCode. Verified:
+              - close browser (clear in-memory) + reopen at /assessment/scenario -> stays on
+                scenario, stepper shows SCENARIO as current.
+              - Clear localStorage + reload /assessment/scenario -> bounced to /.
+
+  - task: "Placeholder pages wired to PATCH + zustand session store"
+    implemented: true
+    working: true
+    file: "frontend/src/pages/stages/*, store/sessionStore.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            StagePlaceholder now calls advanceStage(next) / advanceStage(prev) via the store
+            before navigating. Each stage page declares its prevStage/prevPath/nextStage/nextPath.
+            Back on psychometric PATCHes to 'context'; forward flow submits each next stage.
+            Old React Context replaced by Zustand store (`useSession`). Store shape per spec:
+            { sessionId, resumeCode, participant, stage, loading, error,
+              startSession, hydrateFromResumeCode, hydrateFromLocalStorage,
+              advanceStage, goBack, saveAndExit, clearLastCreated, fullReset }.
+
+  - task: "Privacy copy updated on /context"
+    implemented: true
+    working: true
+    file: "frontend/src/pages/Context.js"
+    stuck_count: 0
+    priority: "low"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Privacy note replaced verbatim: "Your responses are stored securely and used only for
+            your assessment and authorised review. Sessions are deleted 60 days after completion
+            unless flagged for archive." Styling unchanged (mist background, gold left border).
 
 metadata:
   created_by: "main_agent"
-  version: "0.1.0-phase1"
-  test_sequence: 0
+  version: "0.2.0-phase2"
+  test_sequence: 1
   run_ui: false
 
 test_plan:
@@ -166,10 +258,51 @@ test_plan:
 agent_communication:
     - agent: "main"
       message: |
-        Phase 1 build complete. Scaffolded full FARM stack from scratch inside /app (the repo itself
-        is the SOE Transformation Readiness Assessment repo — reference docs live in /app/research/).
-        Backend: FastAPI with /api/health + /api/docs. Frontend: CRA+craco+Tailwind with 7 routes,
-        5-stage progress stepper, full navigable flow. No real assessment logic yet (reserved for Phase 2).
-        Verified acceptance criteria manually via Playwright screenshots at 1440px and 375px.
-        Not running deep_testing_backend_v2 for Phase 1 because the only backend changes are the
-        trivial /api/health endpoint and exposing FastAPI docs under /api/* — both verified via curl.
+        Phase 2 complete. Acceptance criteria 1-10 all met. Backend has 4 new session endpoints
+        all under /api with pydantic validation and are visible in /api/docs. Frontend has a new
+        /start page, a Resume modal on /, a Save & exit button on /assessment/*, and a Zustand
+        store that hydrates from localStorage (sessionId+resumeCode only, no PII). Mongo
+        `sessions` collection has the exact schema per spec with unique index on resume_code and
+        compound index on status+expires_at. No PII appears in INFO logs (verified via grep).
+        Methodology content inventory delivered separately in the main chat; documents 19, 20,
+        21, 22 are all present and usable verbatim in Phase 4/5/6. Document 23 (Synthesis Prompt)
+        is referenced but MISSING from the repo — this is the one real gap and will need to be
+        authored before Phase 7.
+        For Phase 5 AI Fluency Discussion: Claude Opus 4.6 IS available via emergentintegrations
+        as `claude-opus-4-6`. Documented for later.
+    - agent: "testing"
+      message: |
+        Phase 2 backend verification complete. Ran /app/backend_test.py against the public
+        ingress URL (https://farm-readiness.preview.emergentagent.com/api). 31/31 assertions
+        passed.
+          A. Happy path (4/4): POST /api/sessions -> 201; UUID session_id; resume_code matches
+             ^[A-Z0-9]{4}-[A-Z0-9]{4}$ (e.g. 'P5VS-QRZT'); stage='identity'.
+          B. Input validation (7/7): missing consent, consent=false, missing name, empty name,
+             whitespace-only name, invalid email, and malformed JSON all return 422 with a
+             `detail` key — no 500s.
+          C. Resume (3/3): GET /sessions/resume/{code} with and without the dash both 200 and
+             return {session_id, stage, participant}; unknown code returns 404 with exact body
+             {"detail": "Resume code not found."}.
+          D. Stage transitions (7/7): identity->context->psychometric->ai-discussion->scenario
+             ->processing->results all 200 with {stage, updated_at}. On reaching 'results' the
+             session record gets status='completed', completed_at set, and expires_at exactly
+             completed_at + 60 days (verified by parsing ISO timestamps, delta = 60d ± <2s).
+             Back by 1 (psychometric->context) 200. Stay (context->context) 200. Skip
+             (context->scenario) -> 400 with "Invalid stage transition ... Only move one stage
+             forward, stay, or go back one stage." Unknown stage 'bananas' -> 422 with
+             literal_error. PATCH on bogus session id -> 404 "Session not found."
+          E. GET /sessions/{id} (4/4): Returns all 15 expected fields; participant matches the
+             submitted payload; defaults answers=[], conversation=[], scenario_responses={},
+             deliverable=null, scores=null, archived=false. Bogus id -> 404.
+          F. Rate limiting (2/2): 10 consecutive POSTs from X-Forwarded-For=198.51.100.77 all
+             201, 11th returned 429 with detail "Too many sessions from this IP. Limit is 10
+             per hour."
+          G. Log hygiene (1/1): tail -n 2000 /var/log/supervisor/backend.out.log shows zero
+             INFO-level lines containing our test email (@example.com) or the participant name
+             "Alice Whittaker". DEBUG logging of participant is used in code but INFO is clean.
+          H. Docs (2/2): /api/docs returns 200 with Swagger UI; /api/openapi.json lists all 4
+             endpoints (POST /api/sessions, GET /api/sessions/resume/{resume_code},
+             PATCH /api/sessions/{session_id}/stage, GET /api/sessions/{session_id}).
+        No code changes were made. All priority-high backend tasks are working; nothing is
+        stuck. Main agent can proceed with Phase 3.
+

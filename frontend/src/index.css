@@ -48,4 +48,7 @@
   .eyebrow {
     @apply text-xs tracking-wider2 uppercase text-gold font-medium;
   }
+  .form-input {
+    @apply w-full bg-white border border-hairline px-4 py-3 text-base text-ink font-sans transition-colors duration-150 focus:border-navy focus:outline-none placeholder:text-muted;
+  }
 }
