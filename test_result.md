@@ -245,17 +245,170 @@ frontend:
 
 metadata:
   created_by: "main_agent"
-  version: "0.4.0-phase4"
-  test_sequence: 3
+  version: "0.5.0-phase5"
+  test_sequence: 4
   run_ui: false
 
 test_plan:
   current_focus:
-    - "Psychometric: next/answer/progress endpoints, scoring, admin read"
-    - "Regression: Phase 2 + Phase 3 endpoints still pass"
+    - "AI Discussion endpoints (start/message/complete/state/retry)"
+    - "LLM router 3-tier cascade under live calls"
+    - "Scoring JSON parse + retry + graceful failure"
+    - "Regression: Phase 2-4 endpoints"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 5 complete. Added:
+          - `services/ai_discussion_service.py`: Doc 21 SYSTEM_PROMPT verbatim, 3 opening probes
+            verbatim, deterministic session-hashed opener selection, prompt assembly with
+            participant context (first-name only, bands not numbers), final-turn note, strict
+            JSON scoring prompt + extractor + schema validator.
+          - 5 new participant endpoints under /api/assessment/ai-discussion: start, message,
+            complete, state, retry. All consume the Phase-3 llm_router cascade.
+          - session.conversation[] append-only with provider/model/latency/fallbacks_tried on
+            assistant turns. session.ai_discussion tracks status/started_at/completed_at/
+            user_turn_count/exit_reason/opener.
+          - Turn-numbering convention: opening assistant turn = 0, user turn N (1..12) = N,
+            assistant reply to user-turn N also carries N. user_turn_count = count of user turns.
+          - On the 12th user turn, assistant is instructed to emit ONLY the Doc 21 closing line;
+            scoring runs in the same request, writes scores.ai_fluency with _meta (provider/
+            model/fallbacks_tried). Early /complete runs scoring too (requires turn_count>=3).
+          - Emergent fallback rebuilt to use LlmChat.with_params(max_tokens=...) and a clean
+            [PRIOR CONVERSATION]/[Interviewer]/[Participant] bracketed format in system_message
+            — no more "User:" prefix that would trigger the model to hallucinate participant turns.
+          - 20 new unit tests in tests/test_ai_discussion_service.py (opener determinism, ctx
+            builder, JSON extraction with fences/prose/nested, schema validator for all 5
+            failure modes, scoring happy path + retry + double-fail graceful).
+          - 43/43 unit tests pass. Live end-to-end verified: 3 real turns via Emergent fallback
+            (Claude Opus 4.6), /complete runs, scores.ai_fluency populated with overall_score
+            + 5 components + evidence + key_quotes + strengths + blind_spots + _meta.
+        Doc 21 conflicts resolved:
+          - Confidence field is "high"/"medium"/"low" per Doc 21 (brief had 0..1 or 1..5; Doc 21 wins).
+        Please sweep Phase 5 backend thoroughly.
+
+backend:
+  - task: "AI Fluency Discussion endpoints + scoring (Phase 5)"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/services/ai_discussion_service.py, backend/services/llm_router.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            End-to-end manually verified with real Emergent fallback (Claude Opus 4.6):
+            /start produces opener; 3 user turns return contextual probing replies from Doc 21
+            persona without hallucinated Participant turns; /complete finalises + scores. Resume
+            via /state on refresh hydrates the transcript cleanly. Unit tests cover prompt
+            assembly, JSON extraction (fenced/nested/trailing-prose), validator rejections, and
+            scoring retry+fail paths (43/43 pass).
+        - working: true
+    - agent: "testing"
+      message: |
+        Phase 5 backend sweep: 45/46 passed. See letters A–M detail in the Phase-5
+        task status_history above.
+
+        Only failure: [J] MINOR — Public GET /api/sessions/{id} leaks assistant-turn
+        internals (provider, model, latency_ms, fallbacks_tried) in the conversation[]
+        array. Spec says these should be stripped via the _public_conversation helper.
+        Suggested fix (one line): in get_session(), set
+          doc["conversation"] = _public_conversation(doc.get("conversation") or [])
+        before returning. Not a security-critical leak (no PII, no keys, no prompts),
+        but a spec deviation.
+
+        A–I, K–M all green. Live 3-turn loop via Emergent Claude Opus 4.6 works end to
+        end, scoring returns a schema-valid overall_score=3.4 with all 5 components,
+        and no Participant: hallucinations observed. /api/openapi.json lists all 5
+        new endpoints. Log hygiene is clean at INFO level.
+
+          agent: "testing"
+          comment: |
+            Phase 5 backend sweep complete. Ran /app/backend_test_phase5.py against
+            http://localhost:8001/api. 45/46 assertions passed. Only failure is a minor
+            spec deviation on public conversation shape (letter J below).
+
+              A. Gate check: POST /start at stage=identity -> 409
+                 {detail:{message:"AI discussion not yet unlocked. Complete the psychometric
+                 first.", current_stage:"identity"}}. After driving context -> psychometric
+                 (20x value=4 answers) -> ai-discussion and POST /start -> 200.
+              B. /start response shape: {messages:[opener], user_turn_count:0, can_submit:true,
+                 at_cap:false, status:"in_progress"}. Opener text was verbatim
+                 OPENING_PROBES[1] ("To kick us off—what's the most useful thing AI has done
+                 for you recently..."). Re-calling /start on the same in_progress session
+                 returned a single-message payload (no duplicate opener persisted).
+              C. 3-turn live loop via Emergent fallback all succeed:
+                 turn 1 (2.9s), turn 2 (3.6s), turn 3 (4.7s). Conversation grows 1→3→5→7
+                 entries. Assistant turn numbers = 1,2,3 matching user turn numbers. No
+                 "[Participant]:" / "Participant:" prefix in any assistant content (regex
+                 check). Claude Opus 4.6 via Emergent returns contextual probing follow-ups
+                 that directly reference the participant's prior statements.
+              D. Validation: empty content -> 422; 2001-char content -> 422; missing
+                 session_id -> 422. No 500s.
+              E. /complete after 3 turns -> 200 {status:"completed", user_turn_count:3}.
+                 Second call is idempotent -> same body. Pre-3 test on a separate session
+                 with only 1 user turn returned 409 with detail.message
+                 "Please complete at least three exchanges before ending.".
+              F. POST /message after /complete -> 409 {detail:{message:"AI discussion is not
+                 in progress.", status:"completed"}}.
+              G. /state — unknown session 404; pre-start session returns
+                 {status:null, messages:[], user_turn_count:0}; completed session returns
+                 {status:"completed", can_submit:false, at_cap:false, user_turn_count:3,
+                 messages len=7}. All matches spec.
+              H. Resume: fresh session, drove to ai-discussion, /start, /message once. Cold
+                 GET /state returned 3 messages with turns=[0,1,1] and roles=
+                 [assistant,user,assistant]. Turn numbering preserved across the cold read.
+              I. Admin GET /api/admin/sessions/{id}: all 3 assistant turns carry
+                 provider="emergent", model="claude-opus-4-6", latency_ms>0, fallbacks_tried=0.
+                 scores.ai_fluency populated with overall_score=3.4 (float), all 5 components
+                 (capability_understanding, paradigm_awareness, orchestration_concepts,
+                 governance_thinking, personal_usage) each with integer score 1-5,
+                 confidence ∈ {high,medium,low}, evidence:list[str]. key_quotes, blind_spots,
+                 strengths all list[str]. _meta = {provider:"emergent",
+                 model:"claude-opus-4-6", fallbacks_tried:0}. NO scoring_error.
+              J. MINOR: Public GET /api/sessions/{id} — scores IS null (✅), conversation
+                 IS exposed (✅, len=7). However, assistant turns in the PUBLIC response
+                 still carry {provider, model, latency_ms, fallbacks_tried}, leaking
+                 backend internals. The brief says this should be stripped via the
+                 _public_conversation helper. Current get_session() in server.py does
+                 NOT invoke _public_conversation — it returns the raw doc with only
+                 scores/deliverable nulled. The helper exists at server.py:584 but is
+                 only applied by the ai-discussion endpoints. Suggested fix: in
+                 get_session, replace doc["conversation"] with
+                 _public_conversation(doc.get("conversation") or []) before returning.
+                 Not a security-critical leak (no PII, no keys), but a spec violation.
+              K. Log hygiene: tail -n 4000 /var/log/supervisor/backend.*.log checked for
+                 user message content needles ("writing assistant", "pattern-matches",
+                 "Agentic AI") at " - INFO - " level — zero hits. INFO lines only show
+                 session_id, turn number, provider/model/latency.
+              L. OpenAPI /api/openapi.json lists all 5 new paths:
+                 /api/assessment/ai-discussion/{start, message, complete, state, retry}.
+                 Total 21 /api/* paths enumerated.
+              M. Regression — Phase 2/3/4 endpoints all still respond correctly:
+                 POST /api/sessions 201, GET /sessions/resume/{code} 200, PATCH
+                 /sessions/{id}/stage 200, GET /sessions/{id} 200, admin /auth/me 200,
+                 admin /settings 200, psychometric /next 200, /progress 200, admin
+                 /sessions/{id} 200. (Live /admin/settings/test-fallback skipped to
+                 conserve Emergent token budget — was verified in Phase 3 with ok:true,
+                 latency_ms=3548ms.)
+
+            No 500s observed. No secret/key leaks. Scoring payload is clean and
+            schema-valid — overall_score=3.4 is a realistic value for a 3-turn
+            conversation with a capable senior participant. The Emergent fallback is
+            the only configured tier so fallbacks_tried=0 across the board, as expected.
+
+            Harness notes (test-side): fresh X-Forwarded-For per session creation to
+            avoid the 10/hr POST /sessions rate limit, and per psychometric answer
+            sequence to avoid the 60/min /answer rate limit. Admin JWT extracted once
+            from Set-Cookie and replayed via explicit Cookie header (cookie is Secure
+            so requests.Session cannot replay over http://localhost). Real browsers
+            on the HTTPS preview URL replay automatically — test-harness workaround,
+            not a server bug.
 
 agent_communication:
     - agent: "main"

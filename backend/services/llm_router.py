@@ -217,7 +217,14 @@ async def _straico_call(api_key: str) -> ProviderCall:
 
 async def _emergent_call_factory() -> ProviderCall:
     """Emergent LLM key call via emergentintegrations. Always uses Anthropic-side
-    through the universal key. Session ID is per-call so no history leaks."""
+    through the universal key. Session ID is per-call so no history leaks.
+
+    emergentintegrations' LlmChat takes a single system_message + a single UserMessage.
+    To pass multi-turn history we (a) put the prior exchanges inside the system_message
+    under a clear [PRIOR CONVERSATION] block, (b) only pass the latest USER turn as
+    UserMessage, and (c) instruct the model explicitly to respond ONLY as the
+    Interviewer/Assistant — preventing fake 'User:' continuations.
+    """
     from emergentintegrations.llm.chat import LlmChat, UserMessage
     import uuid as _uuid
 
@@ -226,22 +233,50 @@ async def _emergent_call_factory() -> ProviderCall:
     async def _call(messages, system, max_tokens, model):
         if not emergent_key:
             raise RuntimeError("EMERGENT_LLM_KEY is not configured.")
+
+        # Split: everything except the last user message is history.
+        history = []
+        last_user = ""
+        if messages:
+            # Walk from the end; find the last user message
+            for idx in range(len(messages) - 1, -1, -1):
+                if messages[idx].get("role") == "user":
+                    last_user = messages[idx].get("content", "")
+                    history = messages[:idx] + messages[idx + 1:]
+                    break
+            else:
+                # No user message at all — take the last message as the prompt
+                last_user = messages[-1].get("content", "")
+                history = messages[:-1]
+
+        # Compose a clean system message that contains Doc-21 prompt + a bracketed
+        # prior-conversation block. Use unambiguous bracketed role markers so the
+        # model cannot accidentally continue a "User:" role.
+        sys_parts = []
+        if system:
+            sys_parts.append(system)
+        if history:
+            sys_parts.append(
+                "\n\n[PRIOR CONVERSATION — for context only]\n"
+                "The exchanges below have already happened. Do NOT repeat them, and "
+                "do NOT generate any turn labelled [Participant]. Respond only as the "
+                "Interviewer to the Participant's next message.\n\n"
+                + "\n\n".join(
+                    f"[{ 'Interviewer' if m.get('role')=='assistant' else 'Participant' }] "
+                    f"{m.get('content','')}"
+                    for m in history if m.get('role') in ('user', 'assistant')
+                )
+                + "\n\n[END PRIOR CONVERSATION]"
+            )
+        composed_system = "\n\n".join(sys_parts) if sys_parts else "You are a helpful assistant."
+
         chat_obj = LlmChat(
             api_key=emergent_key,
             session_id=f"soe-tra-{_uuid.uuid4()}",
-            system_message=system or "You are a helpful assistant.",
-        ).with_model("anthropic", model)
-        # Flatten multi-turn messages into a single user prompt (tiers collapse).
-        if len(messages) == 1 and messages[0].get("role") == "user":
-            text = messages[0]["content"]
-        else:
-            lines = []
-            for m in messages:
-                role = m.get("role", "user")
-                prefix = {"user": "User", "assistant": "Assistant", "system": "System"}.get(role, role)
-                lines.append(f"{prefix}: {m.get('content', '')}")
-            text = "\n".join(lines)
-        user_message = UserMessage(text=text)
+            system_message=composed_system,
+        ).with_model("anthropic", model).with_params(max_tokens=max_tokens)
+
+        user_message = UserMessage(text=last_user or " ")
         return await chat_obj.send_message(user_message)
     return _call
 

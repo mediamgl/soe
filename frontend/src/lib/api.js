@@ -6,7 +6,7 @@ export const API_BASE = `${BACKEND_URL}/api`;
 const client = axios.create({
   baseURL: API_BASE,
   headers: { 'Content-Type': 'application/json' },
-  timeout: 15000,
+  timeout: 90000,  // LLM calls can take a while; Claude Opus is not fast
 });
 
 export async function createSession(form) {
@@ -30,28 +30,41 @@ export async function patchStage(sessionId, stage) {
   return data;
 }
 
-// --- Psychometric (Phase 4) ---------------------------------------------- //
+// --- Psychometric ------------------------------------------------------- //
 export async function psychNext(sessionId) {
-  const { data } = await client.get(`/assessment/psychometric/next`, {
-    params: { session_id: sessionId },
-  });
+  const { data } = await client.get(`/assessment/psychometric/next`, { params: { session_id: sessionId } });
   return data;
 }
-
 export async function psychProgress(sessionId) {
-  const { data } = await client.get(`/assessment/psychometric/progress`, {
-    params: { session_id: sessionId },
-  });
+  const { data } = await client.get(`/assessment/psychometric/progress`, { params: { session_id: sessionId } });
   return data;
 }
-
 export async function psychAnswer(sessionId, itemId, value, responseTimeMs) {
   const { data } = await client.post(`/assessment/psychometric/answer`, {
-    session_id: sessionId,
-    item_id: itemId,
-    value,
-    response_time_ms: responseTimeMs,
+    session_id: sessionId, item_id: itemId, value, response_time_ms: responseTimeMs,
   });
+  return data;
+}
+
+// --- AI Fluency Discussion (Phase 5) ------------------------------------ //
+export async function aiStart(sessionId) {
+  const { data } = await client.post(`/assessment/ai-discussion/start`, { session_id: sessionId });
+  return data;
+}
+export async function aiMessage(sessionId, content) {
+  const { data } = await client.post(`/assessment/ai-discussion/message`, { session_id: sessionId, content });
+  return data;
+}
+export async function aiComplete(sessionId) {
+  const { data } = await client.post(`/assessment/ai-discussion/complete`, { session_id: sessionId });
+  return data;
+}
+export async function aiState(sessionId) {
+  const { data } = await client.get(`/assessment/ai-discussion/state`, { params: { session_id: sessionId } });
+  return data;
+}
+export async function aiRetry(sessionId) {
+  const { data } = await client.post(`/assessment/ai-discussion/retry`, { session_id: sessionId });
   return data;
 }
 

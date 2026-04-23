@@ -43,7 +43,9 @@ from services.llm_router import (
     chat as router_chat,
     LLMRouterError,
     categorise_exception,
+    Tier,
 )
+from services import ai_discussion_service as ai_svc
 import psychometric_service
 
 ROOT_DIR = Path(__file__).parent
@@ -96,9 +98,12 @@ RATE_LIMIT_LOGIN_MAX = 10
 RATE_LIMIT_LOGIN_WINDOW = 15 * 60  # 15 min
 RATE_LIMIT_ANSWER_MAX = 60
 RATE_LIMIT_ANSWER_WINDOW = 60  # per minute
+RATE_LIMIT_AIMSG_MAX = 30
+RATE_LIMIT_AIMSG_WINDOW = 60  # per minute
 _sessions_ip_hits: Dict[str, deque] = defaultdict(deque)
 _login_ip_hits: Dict[str, deque] = defaultdict(deque)
 _answer_ip_hits: Dict[str, deque] = defaultdict(deque)
+_aimsg_ip_hits: Dict[str, deque] = defaultdict(deque)
 
 
 def _rate_limit_check(bucket: Dict[str, deque], ip: str, max_hits: int, window_sec: int) -> bool:
@@ -558,6 +563,394 @@ async def psychometric_answer(payload: PsychometricAnswerIn, request: Request):
     logger.info("Psychometric answer session=%s item=%s (%d/%d)",
                 payload.session_id, payload.item_id, progress["answered"], progress["total"])
     return {"progress": progress, "done": progress["done"]}
+
+
+# --------------------------------------------------------------------------- #
+# Routes — AI Fluency Discussion (Phase 5)
+# --------------------------------------------------------------------------- #
+class AIDiscStartIn(BaseModel):
+    session_id: str
+
+
+class AIDiscMessageIn(BaseModel):
+    session_id: str
+    content: str = Field(..., min_length=1, max_length=ai_svc.MAX_USER_INPUT_CHARS)
+
+
+class AIDiscCompleteIn(BaseModel):
+    session_id: str
+
+
+def _public_conversation(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip developer notes and provider/model internals from the participant view."""
+    out = []
+    for t in conversation or []:
+        if t.get("role") in ("user", "assistant") and t.get("kind") != "dev":
+            out.append({
+                "turn": t.get("turn"),
+                "role": t.get("role"),
+                "content": t.get("content", ""),
+                "timestamp": t.get("timestamp"),
+            })
+    return out
+
+
+def _user_turn_count(conversation: List[Dict[str, Any]]) -> int:
+    return sum(1 for t in (conversation or []) if t.get("role") == "user" and t.get("kind") != "dev")
+
+
+async def _build_session_tiers() -> List[Tier]:
+    """Load admin_settings and build a 3-tier cascade (primary → secondary → Emergent fallback)."""
+    doc = await admin_settings_coll.find_one({"_id": SETTINGS_DOC_ID})
+    return await ai_svc.build_tiers_from_admin_settings(doc)
+
+
+def _participant_ctx_for(doc: Dict[str, Any]) -> str:
+    participant = doc.get("participant") or {}
+    psych_scores = ((doc.get("scores") or {}).get("psychometric")) or None
+    return ai_svc.build_participant_context(participant, psych_scores)
+
+
+@api_router.post("/assessment/ai-discussion/start",
+                 summary="Start the AI Fluency Discussion (produces the opening assistant turn)")
+async def ai_discussion_start(payload: AIDiscStartIn, request: Request):
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    # Gate: must be at ai-discussion stage, not already completed
+    if doc.get("stage") != "ai-discussion":
+        raise HTTPException(status_code=409, detail={
+            "message": "AI discussion not yet unlocked. Complete the psychometric first.",
+            "current_stage": doc.get("stage"),
+        })
+    ai_disc = doc.get("ai_discussion") or {}
+    if ai_disc.get("status") == "completed":
+        # Idempotent: just return the existing state.
+        return {
+            "messages": _public_conversation(doc.get("conversation") or []),
+            "user_turn_count": _user_turn_count(doc.get("conversation") or []),
+            "can_submit": False,
+            "at_cap": True,
+            "status": "completed",
+        }
+    if ai_disc.get("status") == "in_progress":
+        # Already started — return current state instead of duplicating the opener.
+        return {
+            "messages": _public_conversation(doc.get("conversation") or []),
+            "user_turn_count": _user_turn_count(doc.get("conversation") or []),
+            "can_submit": True,
+            "at_cap": _user_turn_count(doc.get("conversation") or []) >= ai_svc.MAX_USER_TURNS,
+            "status": "in_progress",
+        }
+
+    # First start — generate opener, call the LLM
+    opener = ai_svc.select_opener(payload.session_id)
+    participant_ctx = _participant_ctx_for(doc)
+    tiers = await _build_session_tiers()
+    now = _now_iso()
+
+    # Opener: we don't call the model for the opener — the probe text is verbatim from Doc 21.
+    # Just persist it as the assistant's opening turn (turn=0).
+    opening_turn = {
+        "turn": 0,
+        "role": "assistant",
+        "content": opener,
+        "timestamp": now,
+        "provider": "doc21",
+        "model": "doc21-opener",
+        "latency_ms": 0,
+        "fallbacks_tried": 0,
+    }
+
+    # Persist
+    update = {
+        "conversation": [opening_turn],
+        "ai_discussion": {
+            "started_at": now,
+            "completed_at": None,
+            "status": "in_progress",
+            "user_turn_count": 0,
+            "exit_reason": None,
+            "opener": opener,
+        },
+        "updated_at": now,
+    }
+    await sessions_coll.update_one({"session_id": payload.session_id}, {"$set": update})
+    logger.info("AI-Disc start session=%s opener_idx=%d tiers=%d",
+                payload.session_id, ai_svc.OPENING_PROBES.index(opener), len(tiers))
+
+    return {
+        "messages": _public_conversation([opening_turn]),
+        "user_turn_count": 0,
+        "can_submit": True,
+        "at_cap": False,
+        "status": "in_progress",
+    }
+
+
+@api_router.post("/assessment/ai-discussion/message",
+                 summary="Send a user message in the AI Fluency Discussion")
+async def ai_discussion_message(payload: AIDiscMessageIn, request: Request):
+    ip = _client_ip(request)
+    if not _rate_limit_check(_aimsg_ip_hits, ip, RATE_LIMIT_AIMSG_MAX, RATE_LIMIT_AIMSG_WINDOW):
+        raise HTTPException(status_code=429, detail="Too many messages. Please slow down.")
+
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    ai_disc = doc.get("ai_discussion") or {}
+    if ai_disc.get("status") != "in_progress":
+        raise HTTPException(status_code=409, detail={
+            "message": "AI discussion is not in progress.",
+            "status": ai_disc.get("status"),
+        })
+    conversation = list(doc.get("conversation") or [])
+    turn_count = _user_turn_count(conversation)
+    if turn_count >= ai_svc.MAX_USER_TURNS:
+        raise HTTPException(status_code=409, detail={
+            "message": "User turn cap reached.",
+            "user_turn_count": turn_count,
+        })
+
+    # Append user turn
+    user_turn_number = turn_count + 1
+    now = _now_iso()
+    user_turn = {
+        "turn": user_turn_number,
+        "role": "user",
+        "content": payload.content.strip(),
+        "timestamp": now,
+    }
+    conversation.append(user_turn)
+
+    # Is this the final user turn?
+    final_turn = user_turn_number >= ai_svc.MAX_USER_TURNS
+
+    # Build messages for router
+    participant_ctx = _participant_ctx_for(doc)
+    router_messages = ai_svc.build_messages_for_turn(conversation, participant_ctx, final_turn=final_turn)
+    tiers = await _build_session_tiers()
+
+    try:
+        result = await router_chat(
+            messages=router_messages,
+            tiers=tiers,
+            system=ai_svc.SYSTEM_PROMPT,
+            max_tokens=ai_svc.MAX_OUTPUT_TOKENS_PER_TURN,
+            purpose="ai-fluency-turn",
+        )
+    except LLMRouterError as exc:
+        # Persist the user turn even if the model failed — we can retry
+        await sessions_coll.update_one(
+            {"session_id": payload.session_id},
+            {"$set": {
+                "conversation": conversation,
+                "ai_discussion": {**ai_disc, "status": "failed",
+                                  "user_turn_count": user_turn_number,
+                                  "last_error": [f.category for f in exc.failures]},
+                "updated_at": now,
+            }},
+        )
+        raise HTTPException(status_code=503, detail={
+            "message": "We couldn't reach the model. You can retry in a moment.",
+            "retry": True,
+            "category": [f.category for f in exc.failures],
+        })
+
+    # Persist assistant turn
+    assistant_turn = {
+        "turn": user_turn_number,
+        "role": "assistant",
+        "content": result.get("text") or "",
+        "timestamp": _now_iso(),
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "latency_ms": result.get("latency_ms"),
+        "fallbacks_tried": result.get("fallbacks_tried", 0),
+    }
+    conversation.append(assistant_turn)
+
+    update: Dict[str, Any] = {
+        "conversation": conversation,
+        "ai_discussion.user_turn_count": user_turn_number,
+        "ai_discussion.status": "in_progress",
+        "updated_at": _now_iso(),
+    }
+
+    status_after = "in_progress"
+    # If that was the 12th user turn, run scoring and mark completed
+    if final_turn:
+        score_result = await ai_svc.run_scoring(conversation, participant_ctx, tiers)
+        score_payload: Dict[str, Any] = {}
+        if score_result.get("ok"):
+            sp = score_result["payload"]["ai_fluency"]
+            sp["_meta"] = {
+                "provider": score_result.get("provider"),
+                "model": score_result.get("model"),
+                "fallbacks_tried": score_result.get("fallbacks_tried", 0),
+            }
+            score_payload = sp
+        else:
+            score_payload = {
+                "_raw": score_result.get("raw"),
+                "_error": score_result.get("error"),
+                "scoring_error": True,
+            }
+        scores = doc.get("scores") or {}
+        scores["ai_fluency"] = score_payload
+        update["scores"] = scores
+        update["ai_discussion.status"] = "completed"
+        update["ai_discussion.completed_at"] = _now_iso()
+        update["ai_discussion.exit_reason"] = "turn_cap"
+        status_after = "completed"
+
+    await sessions_coll.update_one({"session_id": payload.session_id}, {"$set": update})
+    logger.info("AI-Disc turn session=%s turn=%d provider=%s model=%s latency=%sms status_after=%s",
+                payload.session_id, user_turn_number,
+                assistant_turn.get("provider"), assistant_turn.get("model"),
+                assistant_turn.get("latency_ms"), status_after)
+    logger.debug("AI-Disc content user=%r assistant=%r",
+                 user_turn["content"][:80], assistant_turn["content"][:80])
+
+    return {
+        "messages": _public_conversation(conversation),
+        "user_turn_count": user_turn_number,
+        "at_cap": user_turn_number >= ai_svc.MAX_USER_TURNS,
+        "can_submit": (status_after == "in_progress") and (user_turn_number < ai_svc.MAX_USER_TURNS),
+        "status": status_after,
+    }
+
+
+@api_router.post("/assessment/ai-discussion/complete",
+                 summary="End the AI discussion early and finalise scoring")
+async def ai_discussion_complete(payload: AIDiscCompleteIn):
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    ai_disc = doc.get("ai_discussion") or {}
+    if ai_disc.get("status") == "completed":
+        return {
+            "status": "completed",
+            "user_turn_count": _user_turn_count(doc.get("conversation") or []),
+        }
+    if ai_disc.get("status") not in ("in_progress", "failed"):
+        raise HTTPException(status_code=409, detail="AI discussion has not started.")
+    conversation = list(doc.get("conversation") or [])
+    turn_count = _user_turn_count(conversation)
+    if turn_count < 3:
+        raise HTTPException(status_code=409, detail={
+            "message": "Please complete at least three exchanges before ending.",
+            "user_turn_count": turn_count,
+        })
+
+    # Run scoring now
+    participant_ctx = _participant_ctx_for(doc)
+    tiers = await _build_session_tiers()
+    score_result = await ai_svc.run_scoring(conversation, participant_ctx, tiers)
+    if score_result.get("ok"):
+        sp = score_result["payload"]["ai_fluency"]
+        sp["_meta"] = {
+            "provider": score_result.get("provider"),
+            "model": score_result.get("model"),
+            "fallbacks_tried": score_result.get("fallbacks_tried", 0),
+        }
+        score_payload = sp
+    else:
+        score_payload = {
+            "_raw": score_result.get("raw"),
+            "_error": score_result.get("error"),
+            "scoring_error": True,
+        }
+    scores = doc.get("scores") or {}
+    scores["ai_fluency"] = score_payload
+    now = _now_iso()
+    await sessions_coll.update_one({"session_id": payload.session_id}, {"$set": {
+        "scores": scores,
+        "ai_discussion.status": "completed",
+        "ai_discussion.completed_at": now,
+        "ai_discussion.exit_reason": "participant_exit",
+        "updated_at": now,
+    }})
+    logger.info("AI-Disc complete-early session=%s turns=%d", payload.session_id, turn_count)
+    return {"status": "completed", "user_turn_count": turn_count}
+
+
+@api_router.get("/assessment/ai-discussion/state",
+                summary="Get the AI discussion state for this session")
+async def ai_discussion_state(session_id: str):
+    doc = await sessions_coll.find_one({"session_id": session_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    ai_disc = doc.get("ai_discussion") or {}
+    status = ai_disc.get("status")
+    turn_count = _user_turn_count(doc.get("conversation") or [])
+    return {
+        "status": status,
+        "messages": _public_conversation(doc.get("conversation") or []),
+        "user_turn_count": turn_count,
+        "at_cap": turn_count >= ai_svc.MAX_USER_TURNS,
+        "can_submit": (status == "in_progress") and (turn_count < ai_svc.MAX_USER_TURNS),
+    }
+
+
+@api_router.post("/assessment/ai-discussion/retry",
+                 summary="Retry the last assistant turn after a router failure")
+async def ai_discussion_retry(payload: AIDiscCompleteIn):
+    doc = await sessions_coll.find_one({"session_id": payload.session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    ai_disc = doc.get("ai_discussion") or {}
+    conversation = list(doc.get("conversation") or [])
+    if ai_disc.get("status") != "failed":
+        raise HTTPException(status_code=409, detail="Nothing to retry — discussion is not in failed state.")
+    # Last turn must be a user turn awaiting reply
+    if not conversation or conversation[-1].get("role") != "user":
+        raise HTTPException(status_code=409, detail="No awaiting user turn to retry.")
+    turn_count = _user_turn_count(conversation)
+    final_turn = turn_count >= ai_svc.MAX_USER_TURNS
+    participant_ctx = _participant_ctx_for(doc)
+    router_messages = ai_svc.build_messages_for_turn(conversation, participant_ctx, final_turn=final_turn)
+    tiers = await _build_session_tiers()
+    try:
+        result = await router_chat(
+            messages=router_messages,
+            tiers=tiers,
+            system=ai_svc.SYSTEM_PROMPT,
+            max_tokens=ai_svc.MAX_OUTPUT_TOKENS_PER_TURN,
+            purpose="ai-fluency-turn-retry",
+        )
+    except LLMRouterError as exc:
+        raise HTTPException(status_code=503, detail={
+            "message": "Still cannot reach the model. Try again shortly.",
+            "category": [f.category for f in exc.failures],
+        })
+    assistant_turn = {
+        "turn": turn_count,
+        "role": "assistant",
+        "content": result.get("text") or "",
+        "timestamp": _now_iso(),
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "latency_ms": result.get("latency_ms"),
+        "fallbacks_tried": result.get("fallbacks_tried", 0),
+    }
+    conversation.append(assistant_turn)
+    update = {
+        "conversation": conversation,
+        "ai_discussion.status": "in_progress",
+        "ai_discussion.last_error": None,
+        "updated_at": _now_iso(),
+    }
+    await sessions_coll.update_one({"session_id": payload.session_id}, {"$set": update})
+    return {
+        "messages": _public_conversation(conversation),
+        "user_turn_count": turn_count,
+        "at_cap": final_turn,
+        "can_submit": not final_turn,
+        "status": "in_progress",
+    }
+
 
 
 # --------------------------------------------------------------------------- #
