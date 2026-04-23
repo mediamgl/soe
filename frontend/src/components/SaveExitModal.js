@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import Modal from './Modal';
 import ResumeCodeCard from './ResumeCodeCard';
 import { useSession } from '../store/sessionStore';
+import { flushAll } from '../lib/flushRegistry';
 
 export default function SaveExitModal({ open, onClose }) {
   const resumeCode = useSession((s) => s.resumeCode);
@@ -10,8 +11,16 @@ export default function SaveExitModal({ open, onClose }) {
   const navigate = useNavigate();
   const [leaving, setLeaving] = useState(false);
 
-  function onLeave() {
+  async function onLeave() {
     setLeaving(true);
+    // Synchronously flush any pending debounced writes (e.g. scenario
+    // autosave) BEFORE we clear in-memory state and navigate. flushAll
+    // has an internal timeout so a wedged network cannot block exit.
+    try {
+      await flushAll();
+    } catch (_) {
+      // never block exit on a flush error
+    }
     saveAndExit();
     onClose();
     navigate('/');

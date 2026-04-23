@@ -5,7 +5,9 @@ import { useSession } from '../../store/sessionStore';
 import {
   scnState, scnStart, scnAdvance, scnAutosave,
   apiErrorMessage, apiErrorStatus,
+  API_BASE,
 } from '../../lib/api';
+import { registerFlusher } from '../../lib/flushRegistry';
 import CountdownTimer from '../../components/CountdownTimer';
 
 const PHASE_LABELS = {
@@ -80,6 +82,102 @@ export default function Scenario() {
 
   // Debounced autosave helpers
   const autosaveTimerRef = useRef(null);
+
+  // Refs that always hold the latest values for the flusher / page-close
+  // listener. These are updated on every state change so the flush-on-exit
+  // path never sees stale closures.
+  const sessionIdRef = useRef(sessionId);
+  const phaseRef = useRef(phase);
+  const part1Ref = useRef(part1);
+  const part2Ref = useRef(part2);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
+  useEffect(() => { part1Ref.current = part1; }, [part1]);
+  useEffect(() => { part2Ref.current = part2; }, [part2]);
+
+  // Explicit flush — cancels any pending debounce and POSTs the full trio
+  // for the current writing phase. Used by SaveExit, Continue, and unmount.
+  // Never throws: exit flows must never be blocked by a network failure.
+  const flushNow = useCallback(async () => {
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+    const sid = sessionIdRef.current;
+    const ph = phaseRef.current;
+    if (!sid) return;
+    if (ph !== 'part1' && ph !== 'part2') return;
+    const trio = ph === 'part1' ? part1Ref.current : part2Ref.current;
+    const partial = {
+      q1: typeof trio.q1 === 'string' ? trio.q1 : '',
+      q2: typeof trio.q2 === 'string' ? trio.q2 : '',
+      q3: typeof trio.q3 === 'string' ? trio.q3 : '',
+    };
+    try {
+      const r = await scnAutosave(sid, ph, partial);
+      setSavedAt(r.saved_at);
+    } catch (_) {
+      // Silent — never block navigation on autosave failure.
+    }
+  }, []);
+
+  // Register the flusher so SaveExitModal can await it before navigating away.
+  useEffect(() => {
+    const unregister = registerFlusher(flushNow);
+    return () => {
+      // On unmount, cancel any debounce and unregister. We intentionally do
+      // NOT await an unmount-time network call here because React unmount
+      // cannot await; Save & exit handles the awaited flush path. The
+      // pagehide/visibilitychange beacon below handles browser-close.
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+      unregister();
+    };
+  }, [flushNow]);
+
+  // Browser-close / tab-hide path — use fetch with keepalive:true so the
+  // write survives the unload. Same payload shape as scnAutosave().
+  useEffect(() => {
+    function beacon() {
+      const sid = sessionIdRef.current;
+      const ph = phaseRef.current;
+      if (!sid) return;
+      if (ph !== 'part1' && ph !== 'part2') return;
+      const trio = ph === 'part1' ? part1Ref.current : part2Ref.current;
+      const body = JSON.stringify({
+        session_id: sid,
+        phase: ph,
+        partial: {
+          q1: typeof trio.q1 === 'string' ? trio.q1 : '',
+          q2: typeof trio.q2 === 'string' ? trio.q2 : '',
+          q3: typeof trio.q3 === 'string' ? trio.q3 : '',
+        },
+      });
+      try {
+        // keepalive lets this POST survive page unload.
+        fetch(`${API_BASE}/assessment/scenario/autosave`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          keepalive: true,
+        }).catch(() => {});
+      } catch (_) {
+        // ignore
+      }
+    }
+    function onVis() {
+      if (document.visibilityState === 'hidden') beacon();
+    }
+    window.addEventListener('pagehide', beacon);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('pagehide', beacon);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, []);
+
   const queueAutosave = useCallback((thisPhase, partial) => {
     if (!sessionId) return;
     if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
