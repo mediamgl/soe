@@ -123,7 +123,7 @@ class Tier:
 # tiers 1–3 cap at 30s already; the Emergent fallback (tier 4) had no explicit
 # bound. asyncio.wait_for here gives the cascade ONE consistent ceiling for
 # every tier — see synthesis_service.run_synthesis for the outer 240s budget.
-PER_CALL_TIMEOUT_SEC = 90
+PER_CALL_TIMEOUT_SEC = 180
 
 
 async def chat(
@@ -197,7 +197,7 @@ async def _anthropic_call(
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as c:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=5.0)) as c:
             resp = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
