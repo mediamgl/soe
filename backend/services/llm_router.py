@@ -18,12 +18,35 @@ import os
 import time
 import logging
 import asyncio
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Threaded down to the provider _call so the truncation canary log line can
+# include the caller's purpose (e.g. "synthesis", "ai_discussion"). Set in
+# chat() for the duration of each tier call; provider implementations read
+# it via _PURPOSE_VAR.get(). Kept tiny — only purpose; max_tokens is already
+# passed as an arg.
+_PURPOSE_VAR: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "_llm_router_purpose", default="generic",
+)
+
+
+def _emit_truncation_warning(provider: str, model: str, output_tokens: Any) -> None:
+    """Single source of truth for the canary log line. Format matches the spec
+    in the Phase 9 follow-up: includes purpose, model, output_tokens. Never
+    raises (logging-only)."""
+    try:
+        logger.warning(
+            "LLM response truncated at max_tokens — purpose=%s, model=%s, output_tokens=%s",
+            _PURPOSE_VAR.get(), model, output_tokens,
+        )
+    except Exception:  # pragma: no cover — logging must never fail a request
+        pass
 
 # Type of a provider call: (messages, system, max_tokens, model) -> str
 ProviderCall = Callable[
@@ -100,40 +123,44 @@ async def chat(
     if not tiers:
         raise ValueError("At least one tier (the fallback) is required.")
     failures: List[TierFailure] = []
-    for idx, tier in enumerate(tiers):
-        started = time.time()
-        try:
-            logger.info("LLM cascade[%s/%s] tier=%s provider=%s model=%s purpose=%s",
-                        idx + 1, len(tiers), tier.name, tier.provider, tier.model, purpose)
-            text = await asyncio.wait_for(
-                tier.call(messages, system, max_tokens, tier.model),
-                timeout=PER_CALL_TIMEOUT_SEC,
-            )
-            latency_ms = int((time.time() - started) * 1000)
-            return {
-                "text": text,
-                "provider": tier.provider,
-                "model": tier.model,
-                "latency_ms": latency_ms,
-                "tier": tier.name,
-                "fallbacks_tried": idx,
-            }
-        except asyncio.TimeoutError:
-            failures.append(TierFailure(tier=tier.name, category="timeout",
-                                        message=f"per-call timeout {PER_CALL_TIMEOUT_SEC}s"))
-            logger.warning(
-                "LLM tier timed out after %ss: name=%s provider=%s model=%s",
-                PER_CALL_TIMEOUT_SEC, tier.name, tier.provider, tier.model,
-            )
-        except Exception as exc:  # noqa: BLE001
-            category, msg = categorise_exception(exc)
-            failures.append(TierFailure(tier=tier.name, category=category, message=msg))
-            logger.warning(
-                "LLM tier failed: name=%s provider=%s model=%s category=%s msg=%s",
-                tier.name, tier.provider, tier.model, category, msg,
-            )
-            # auth / rate_limit / timeout / 5xx / 4xx / other — all fall through.
-    raise LLMRouterError(failures)
+    purpose_token = _PURPOSE_VAR.set(purpose)
+    try:
+        for idx, tier in enumerate(tiers):
+            started = time.time()
+            try:
+                logger.info("LLM cascade[%s/%s] tier=%s provider=%s model=%s purpose=%s",
+                            idx + 1, len(tiers), tier.name, tier.provider, tier.model, purpose)
+                text = await asyncio.wait_for(
+                    tier.call(messages, system, max_tokens, tier.model),
+                    timeout=PER_CALL_TIMEOUT_SEC,
+                )
+                latency_ms = int((time.time() - started) * 1000)
+                return {
+                    "text": text,
+                    "provider": tier.provider,
+                    "model": tier.model,
+                    "latency_ms": latency_ms,
+                    "tier": tier.name,
+                    "fallbacks_tried": idx,
+                }
+            except asyncio.TimeoutError:
+                failures.append(TierFailure(tier=tier.name, category="timeout",
+                                            message=f"per-call timeout {PER_CALL_TIMEOUT_SEC}s"))
+                logger.warning(
+                    "LLM tier timed out after %ss: name=%s provider=%s model=%s",
+                    PER_CALL_TIMEOUT_SEC, tier.name, tier.provider, tier.model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                category, msg = categorise_exception(exc)
+                failures.append(TierFailure(tier=tier.name, category=category, message=msg))
+                logger.warning(
+                    "LLM tier failed: name=%s provider=%s model=%s category=%s msg=%s",
+                    tier.name, tier.provider, tier.model, category, msg,
+                )
+                # auth / rate_limit / timeout / 5xx / 4xx / other — all fall through.
+        raise LLMRouterError(failures)
+    finally:
+        _PURPOSE_VAR.reset(purpose_token)
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +186,11 @@ async def _anthropic_call(
             resp = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
+            # Phase 9 follow-up — truncation canary. Anthropic exposes
+            # stop_reason=="max_tokens" + usage.output_tokens. Logged only.
+            if data.get("stop_reason") == "max_tokens":
+                output_tokens = (data.get("usage") or {}).get("output_tokens")
+                _emit_truncation_warning("anthropic", model, output_tokens)
             parts = data.get("content", [])
             return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
     return _call
@@ -176,7 +208,13 @@ async def _openai_call(api_key: str) -> ProviderCall:
             resp = await c.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            choice0 = (data.get("choices") or [{}])[0]
+            if choice0.get("finish_reason") == "length":
+                _emit_truncation_warning(
+                    "openai", model,
+                    (data.get("usage") or {}).get("completion_tokens"),
+                )
+            return choice0.get("message", {}).get("content", "")
     return _call
 
 
@@ -192,7 +230,13 @@ async def _openrouter_call(api_key: str) -> ProviderCall:
             resp = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            choice0 = (data.get("choices") or [{}])[0]
+            if choice0.get("finish_reason") == "length":
+                _emit_truncation_warning(
+                    "openrouter", model,
+                    (data.get("usage") or {}).get("completion_tokens"),
+                )
+            return choice0.get("message", {}).get("content", "")
     return _call
 
 
@@ -208,7 +252,13 @@ async def _grok_call(api_key: str) -> ProviderCall:
             resp = await c.post("https://api.x.ai/v1/chat/completions", headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            choice0 = (data.get("choices") or [{}])[0]
+            if choice0.get("finish_reason") == "length":
+                _emit_truncation_warning(
+                    "grok", model,
+                    (data.get("usage") or {}).get("completion_tokens"),
+                )
+            return choice0.get("message", {}).get("content", "")
     return _call
 
 
@@ -226,8 +276,15 @@ async def _straico_call(api_key: str) -> ProviderCall:
             resp.raise_for_status()
             data = resp.json()
             if "choices" in data:
-                return data["choices"][0]["message"]["content"]
-            # Fallback shape per some Straico endpoints
+                choice0 = (data.get("choices") or [{}])[0]
+                if choice0.get("finish_reason") == "length":
+                    _emit_truncation_warning(
+                        "straico", model,
+                        (data.get("usage") or {}).get("completion_tokens"),
+                    )
+                return choice0.get("message", {}).get("content", "")
+            # Fallback shape per some Straico endpoints — no finish_reason exposed
+            # cleanly here, so we skip the canary on this branch.
             return data.get("response") or data.get("output") or ""
     return _call
 

@@ -221,9 +221,19 @@ def build_synthesis_input(session: Dict[str, Any]) -> Dict[str, Any]:
 # Output schema (concrete + strict so we can validate and render deterministically)
 #
 # Doc 23 asks the synthesis to produce a comprehensive 6-section deliverable.
-# Producing that in a single LLM call reliably exceeds the Emergent proxy's
-# practical output window on claude-opus-4-6 (~2500 tokens before truncation /
-# timeout). We therefore split the synthesis into TWO focused calls:
+# Producing all 6 sections in a single LLM call risks output truncation on
+# claude-opus-4-6, so we split synthesis into TWO focused calls (A: narrative,
+# B: structured). The two payloads are deep-merged and validated against the
+# full schema below.
+#
+# Token budgets (live values — see _run_synthesis_inner):
+#   PART A max_tokens=3000 (was 2000; bumped after observed truncation at
+#                           2,306 output tokens — model verbosity drifted
+#                           ~5% past the prior cap. Successful Phase 7 runs
+#                           sat at ~2,185 tokens, i.e. we were riding the
+#                           edge. 3000 gives ~25–30% headroom.)
+#   PART B max_tokens=3500 (was 2500; same proportional bump pre-emptively,
+#                           since identical drift would bite Part B next.)
 #
 #   PART A — narrative:
 #     executive_summary, integration_analysis, ai_fluency_deep_dive (narrative
@@ -233,8 +243,6 @@ def build_synthesis_input(session: Dict[str, Any]) -> Dict[str, Any]:
 #   PART B — structured:
 #     dimension_profiles (6 items) and ai_fluency_deep_dive.components_table
 #     (5 rows).
-#
-# The two payloads are deep-merged and validated against the full schema below.
 # --------------------------------------------------------------------------- #
 OUTPUT_SCHEMA_INSTRUCTIONS_PART_A = """
 Return ONLY a JSON object. No prose before or after. No markdown fences.
@@ -554,7 +562,7 @@ async def _run_synthesis_inner(
         system_body=SYSTEM_PROMPT,
         user_body=user_body + "\n\nProduce PART A (narrative only) per the output format.",
         schema_instructions=OUTPUT_SCHEMA_INSTRUCTIONS_PART_A,
-        max_tokens=2000,
+        max_tokens=3000,
     )
     if not ok_a:
         return {
@@ -570,7 +578,7 @@ async def _run_synthesis_inner(
         system_body=SYSTEM_PROMPT,
         user_body=user_body + "\n\nProduce PART B (structured dimension profiles + components table) per the output format.",
         schema_instructions=OUTPUT_SCHEMA_INSTRUCTIONS_PART_B,
-        max_tokens=2500,
+        max_tokens=3500,
     )
     if not ok_b:
         return {
