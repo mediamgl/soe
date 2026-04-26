@@ -431,43 +431,18 @@ function AnswerPhase({ kind, content, values, onChange, saving, savedAt }) {
   const preamble = content.preamble;
   const postamble = content.postamble;
 
-  function QuestionBlock({ index, text }) {
-    const key = `q${index + 1}`;
-    const id = `${kind}-${key}`;
-    const value = values[key] || '';
-    const charsLeft = MAX_CHARS - value.length;
-    return (
-      <div className="mt-8">
-        <label htmlFor={id} className="block">
-          <span className="font-serif text-lg text-navy leading-snug" id={`${id}-label`}>
-            <span className="text-gold mr-2">{index + 1}.</span>{text}
-          </span>
-        </label>
-        <textarea
-          id={id}
-          aria-labelledby={`${id}-label`}
-          className="mt-3 w-full bg-white border border-hairline px-4 py-3 text-[15px] text-ink font-sans leading-relaxed focus:border-navy focus:outline-none min-h-[150px] resize-y"
-          rows={6}
-          maxLength={MAX_CHARS}
-          value={value}
-          onChange={(e) => onChange(key, e.target.value)}
-        />
-        <div className="mt-1 text-[10px] uppercase tracking-wider2 text-muted text-right">
-          {charsLeft < 300 && (
-            <span className={charsLeft < 0 ? 'text-red-700' : 'text-gold'}>
-              {value.length}/{MAX_CHARS}
-            </span>
-          )}
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="mt-10">
       {preamble && <p className="text-ink/80 leading-relaxed">{preamble}</p>}
       {questions.map((q, i) => (
-        <QuestionBlock key={i} index={i} text={q} />
+        <QuestionBlock
+          key={i}
+          kind={kind}
+          values={values}
+          onChange={onChange}
+          index={i}
+          text={q}
+        />
       ))}
       {postamble && (
         <p className="mt-6 text-xs uppercase tracking-wider2 text-muted">{postamble}</p>
@@ -478,6 +453,43 @@ function AnswerPhase({ kind, content, values, onChange, saving, savedAt }) {
         ) : savedAt ? (
           <SavedAgo timestamp={savedAt} />
         ) : null}
+      </div>
+    </div>
+  );
+}
+
+// Module-scope component. Previously declared INSIDE AnswerPhase, which gave
+// it a fresh function identity on every parent render — React unmounted and
+// remounted each <textarea>, dropping focus on every keystroke (a textbook
+// anti-pattern). Hoisted here so the textarea instance is stable across the
+// 400 ms autosave-driven re-renders introduced in the Phase 9 hotfix (G2).
+function QuestionBlock({ kind, values, onChange, index, text }) {
+  const key = `q${index + 1}`;
+  const id = `${kind}-${key}`;
+  const value = values[key] || '';
+  const charsLeft = MAX_CHARS - value.length;
+  return (
+    <div className="mt-8">
+      <label htmlFor={id} className="block">
+        <span className="font-serif text-lg text-navy leading-snug" id={`${id}-label`}>
+          <span className="text-gold mr-2">{index + 1}.</span>{text}
+        </span>
+      </label>
+      <textarea
+        id={id}
+        aria-labelledby={`${id}-label`}
+        className="mt-3 w-full bg-white border border-hairline px-4 py-3 text-[15px] text-ink font-sans leading-relaxed focus:border-navy focus:outline-none min-h-[150px] resize-y"
+        rows={6}
+        maxLength={MAX_CHARS}
+        value={value}
+        onChange={(e) => onChange(key, e.target.value)}
+      />
+      <div className="mt-1 text-[10px] uppercase tracking-wider2 text-muted text-right">
+        {charsLeft < 300 && (
+          <span className={charsLeft < 0 ? 'text-red-700' : 'text-gold'}>
+            {value.length}/{MAX_CHARS}
+          </span>
+        )}
       </div>
     </div>
   );

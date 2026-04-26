@@ -3,21 +3,30 @@ import { X } from 'lucide-react';
 
 export default function Modal({ open, onClose, title, children, size = 'md' }) {
   const panelRef = useRef(null);
+  // Keep onClose in a ref so the effect below doesn't re-run when the parent
+  // passes a new function identity on each render. Without this, an inline
+  // arrow like `onClose={() => setOpen(false)}` (recreated on every parent
+  // render) would re-trigger the effect, calling panelRef.focus() and
+  // stealing focus from any input the user is typing in. Classic React
+  // focus-loss footgun. Single dep `[open]` + ref makes the effect a true
+  // mount-on-open / cleanup-on-close.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
 
   useEffect(() => {
     if (!open) return undefined;
     const onKey = (e) => {
-      if (e.key === 'Escape' && onClose) onClose();
+      if (e.key === 'Escape' && onCloseRef.current) onCloseRef.current();
     };
     document.addEventListener('keydown', onKey);
-    // focus panel for a11y
+    // focus panel for a11y — runs ONCE per open transition (deps = [open])
     if (panelRef.current) panelRef.current.focus();
     document.body.style.overflow = 'hidden';
     return () => {
       document.removeEventListener('keydown', onKey);
       document.body.style.overflow = '';
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
