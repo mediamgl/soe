@@ -71,6 +71,21 @@ class LLMRouterError(Exception):
 def categorise_exception(exc: Exception) -> Tuple[str, str]:
     """Convert a provider exception into (category, short_message).
     category ∈ {auth, rate_limit, timeout, 5xx, 4xx, other}."""
+    # Phase 9 follow-up — the Emergent fallback wraps any inner failure
+    # (including LiteLLM's "retries exhausted" or per-attempt timeout) as
+    # `emergentintegrations.llm.chat.ChatError`. The original exception
+    # type and traceback are lost; only the message survives. Sniff the
+    # message for timeout-shaped wording so logs and dashboards bucket
+    # these correctly instead of dumping them in 'other'.
+    exc_name = type(exc).__name__
+    if exc_name == "ChatError":
+        msg = str(exc).lower()
+        if ("timeout" in msg) or ("timed out" in msg) or ("retries exceeded" in msg):
+            return "timeout", f"ChatError (likely upstream timeout): {str(exc)[:200]}"
+        if ("connection" in msg) or ("connection error" in msg) or ("disconnected" in msg):
+            return "timeout", f"ChatError (upstream connection error): {str(exc)[:200]}"
+        # Fall through to "other" but surface the inner str so logs are useful.
+        return "other", f"ChatError: {str(exc)[:200]}"
     if isinstance(exc, httpx.TimeoutException):
         return "timeout", "timeout"
     if isinstance(exc, httpx.HTTPStatusError):
@@ -344,11 +359,40 @@ async def _emergent_call_factory() -> ProviderCall:
             )
         composed_system = "\n\n".join(sys_parts) if sys_parts else "You are a helpful assistant."
 
+        # Phase 9 follow-up — bound LiteLLM/OpenAI-client per-attempt time
+        # and disable the OpenAI client's internal retry logic. Without this,
+        # an upstream slowdown at Anthropic claude-opus-4-6 (proxy cuts the
+        # connection at ~60s) makes the OpenAI client retry 2x → 3 attempts
+        # × 60s = 180s before the wrapper raises ChatError. Our 90s
+        # asyncio.wait_for cannot save us because litellm.completion is
+        # SYNC and blocks the event loop — wait_for cancellation has no
+        # effect on a sync inner call.
+        #
+        # Empirical attempt 1: passing `num_retries=1` did NOT change the
+        # 180s pattern — that param is LiteLLM-level (alias for max_retries
+        # in litellm's own retry loop) and didn't reach the OpenAI client's
+        # internal retry counter.
+        #
+        # Attempt 2 (this one): pass `max_retries=0` directly. LiteLLM's
+        # source maps `max_retries` straight to the openai SDK client's
+        # `max_retries` param when custom_llm_provider="openai", which is
+        # the path the Emergent fallback uses. Setting 0 means: try once,
+        # fail fast on the first proxy timeout, surface to our outer retry
+        # branch in _run_synthesis_task.
+        #
+        # Pass-through trace: with_params(**kwargs) → self.extra_params →
+        # _execute_completion does params.update(self.extra_params) →
+        # litellm.completion(**params). Confirmed in
+        # emergentintegrations/llm/chat.py.
         chat_obj = LlmChat(
             api_key=emergent_key,
             session_id=f"soe-tra-{_uuid.uuid4()}",
             system_message=composed_system,
-        ).with_model("anthropic", model).with_params(max_tokens=max_tokens)
+        ).with_model("anthropic", model).with_params(
+            max_tokens=max_tokens,
+            timeout=120,
+            max_retries=0,
+        )
 
         user_message = UserMessage(text=last_user or " ")
         return await chat_obj.send_message(user_message)
