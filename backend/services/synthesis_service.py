@@ -253,7 +253,7 @@ each section must fit comfortably within the word budgets.
   "executive_summary": {
     "overall_category": "Transformation Ready" | "High Potential" | "Development Required" | "Limited Readiness",
     "category_statement": string,      // Doc 23 language, ~1 sentence
-    "prose": string,                   // 120-150 word paragraph of integrated synthesis
+    "prose": string,                   // 120-150 word paragraph of integrated synthesis. If the bundle's psychometric.response_pattern_flag is non-null, append a one-sentence caveat to `prose` noting that the participant's psychometric self-report may reflect aspirational self-presentation more than current state. Do not name the specific flag value to the participant.
     "key_strengths": [                 // EXACTLY 2 items
       {"heading": string, "evidence": string}
     ],

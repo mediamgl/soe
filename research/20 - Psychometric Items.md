@@ -36,7 +36,7 @@ Based on research from Korn Ferry, CCL, and academic learning agility literature
 
 **LA02** — When facing a complex issue, I naturally look for connections to other domains or experiences.
 
-**LA03** — I'm comfortable holding multiple contradictory ideas while working toward a resolution.
+**LA03R** — When I'm weighing two strong but competing arguments, I find it useful to commit to one early so my thinking stays sharp. [REVERSE]
 
 ### People Agility (Items 4-5)
 
@@ -48,7 +48,7 @@ Based on research from Korn Ferry, CCL, and academic learning agility literature
 
 **LA06** — I volunteer for assignments where I'll need to learn something new.
 
-**LA07** — I find the uncertainty of new situations more energising than stressful.
+**LA07R** — When my organisation introduces a new way of working, I stay focused on the approach that's been delivering results for me. [REVERSE]
 
 **LA08** — When an approach isn't working, I'm quick to try something different rather than persisting.
 
@@ -56,13 +56,13 @@ Based on research from Korn Ferry, CCL, and academic learning agility literature
 
 **LA09** — I've delivered strong results in situations where I had no established playbook to follow.
 
-**LA10** — When facing obstacles, I find ways to make progress even without ideal resources or support.
+**LA10R** — When I'm missing the resources, support, or authority I need for an initiative, I focus on getting the situation sorted before pushing forward on the initiative. [REVERSE]
 
 ### Self-Awareness (Items 11-12)
 
 **LA11** — I have a clear picture of which situations bring out my best and worst performance.
 
-**LA12** — Feedback that challenges my self-image makes me curious rather than defensive.
+**LA12R** — When I receive feedback I disagree with, I'm usually able to articulate why it doesn't quite fit my situation. [REVERSE]
 
 ---
 
@@ -74,7 +74,7 @@ Based on academic ambiguity tolerance research (Budner, McLain, and subsequent w
 
 **TA01** — I can make decisions confidently even when I don't have all the information I'd like.
 
-**TA02** — When plans are unclear, I maintain my effectiveness rather than becoming anxious.
+**TA02R** — When the path forward isn't clear, I prefer to get clarity before committing my time and effort. [REVERSE]
 
 **TA03** — I'm comfortable committing to a direction while knowing I might need to change course.
 
@@ -90,7 +90,7 @@ Based on academic ambiguity tolerance research (Budner, McLain, and subsequent w
 
 **TA07** — When others push for quick answers, I'm comfortable saying "we don't know yet."
 
-**TA08** — I'd rather sit with uncertainty than accept a false certainty just to feel settled.
+**TA08R** — When a question has stayed unresolved for too long, I'm comfortable making the call so the team can move on. [REVERSE]
 
 ---
 
@@ -98,9 +98,9 @@ Based on academic ambiguity tolerance research (Budner, McLain, and subsequent w
 
 ### Item-Level Scoring
 
-All items are positively worded. No reverse scoring required.
+Items marked `[REVERSE]` are inverted (`v' = 7 - v`) before scale aggregation; raw responses are preserved for response-pattern detection. See **Reverse-Keyed Items** section below.
 
-Raw score = sum of item responses (1-6)
+Raw score = sum of item responses (after reverse-key inversion where applicable; 1-6 each)
 
 ### Dimension-Level Scoring
 
@@ -123,6 +123,53 @@ Raw score = sum of item responses (1-6)
 | 2.5-3.4 | Moderate | Average; development opportunity |
 | 1.5-2.4 | Limited | Below average; significant development needed |
 | 1.0-1.4 | Low | Significant gap; may be difficult to develop |
+
+---
+
+## Reverse-Keyed Items
+
+The following six items are reverse-keyed in v2 of this instrument. Each is phrased as a behaviour that sounds reasonable or virtuous on the surface but mechanically reveals a deficit when endorsed (the "deficit-as-virtue" framing). Endorsing a reverse-keyed item adds **less** to the corresponding subscale score, not more.
+
+| ID | Subscale | `is_reverse_keyed` |
+|----|----------|--------------------|
+| LA03R | Mental Agility | true |
+| LA07R | Change Agility | true |
+| LA10R | Results Agility | true |
+| LA12R | Self-Awareness | true |
+| TA02R | Uncertainty Comfort | true |
+| TA08R | Closure Resistance | true |
+
+### Inversion formula
+
+For each reverse-keyed response value `v` (in 1..6), the transformed value used in mean / subscale / band calculations is:
+
+```
+v' = 7 - v
+```
+
+So `1↔6, 2↔5, 3↔4`. The raw value is preserved on the session document and is the basis for the response-pattern detector below.
+
+### Response-pattern flag
+
+The score payload also includes `response_pattern_flag` computed on the **raw** (un-inverted) responses across all 20 items:
+
+| Flag | Trigger condition |
+|------|-------------------|
+| `"high_acquiescence"` | ≥18 of 20 responses are 5 or 6 (yea-saying / consistent agreement irrespective of reverse direction) |
+| `"low_variance"` | population standard deviation of all 20 raw responses < 0.5 (straight-lining) |
+| `"extreme_response_bias"` | ≥16 of 20 responses are 1 or 6 (use of endpoints only) |
+| `null` | normal pattern |
+
+Tie-break order when multiple conditions are satisfied: `high_acquiescence` > `low_variance` > `extreme_response_bias`.
+
+If the flag is non-null, the synthesis prompt includes a one-sentence caveat in the executive summary that the participant's psychometric self-report may reflect aspirational self-presentation more than current state. The specific flag value is **not** named to the participant.
+
+---
+
+## Instrument Version
+
+- **v1** (June 2025): 20 positively-worded items.
+- **v2** (April 2026): 6 reverse-keyed items added (LA03R, LA07R, LA10R, LA12R, TA02R, TA08R). Acquiescence detector added.
 
 ---
 
@@ -210,5 +257,5 @@ This data feeds into the Synthesis Prompt alongside AI Discussion and Scenario d
 
 ---
 
-*Last updated: June 2025*
+*Last updated: April 2026 (v2 — reverse-keyed items + acquiescence detector)*
 *For: Mini-Assessment Demo Build*
