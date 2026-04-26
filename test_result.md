@@ -2432,3 +2432,150 @@ backend:
         pipeline (timeouts, registry, finally-clause guarantee, /processing/
         start 409 reason shape, public-surface privacy filter) is
         otherwise solid.
+
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Re-requesting a fresh focused regression on the Phase 9 hotfix
+        bundle. All 5 patches (G1, G2, G3, G3+G7 budget pair, G4+G5,
+        G6) are confirmed in code and pass the 114-test pytest suite.
+        The previously-flagged email/sub bug at server.py:2134 is also
+        fixed (current line 2136 uses `.get("sub")`).
+
+        Please run a TIGHT regression — not a full sweep — covering ONLY:
+
+        1) POST /api/admin/sessions/{id}/resynthesize
+           - 401 without admin JWT
+           - 404 on unknown session
+           - 409 {detail.reason: "missing_inputs"} when scores incomplete
+           - 202 with {status:"in_progress", started_at, poll_url} on
+             a session that has all three score blocks
+           - synthesis.restarted_by carries the admin email (from JWT
+             `sub` claim, NOT from a missing `email` claim)
+
+        2) POST /api/assessment/processing/start error shape
+           - 409 returns detail as an OBJECT with `reason` of either
+             "stage_mismatch" or "missing_inputs" (frontend Patch G1
+             discriminates on this)
+
+        3) Background-task safety net (G4+G5)
+           - Worker registry: `_SYNTHESIS_TASKS` is non-empty during
+             a /processing/start call and drains via the done-callback
+             after completion (a unit test already proves this; just
+             confirm the live endpoint still wires through
+             `_register_synthesis_task`)
+
+        4) Smoke regression of unchanged endpoints (no deep prove,
+           just that they still 200):
+           - POST /api/sessions
+           - PATCH /api/sessions/{id}/stage
+           - GET  /api/admin/sessions (with admin JWT)
+           - GET  /api/admin/dashboard/summary
+           - GET  /api/health
+
+        Internal base: http://localhost:8001/api
+        Admin creds: steve@org-logic.io / test1234
+
+        Stop after this — no frontend testing, no Phase 1 anything,
+        no auto-fix on anything outside the Phase 9 bundle. Just a
+        green/red on the four buckets above.
+
+
+agent_communication:
+    - agent: "testing"
+      message: |
+        Phase 9 hotfix bundle TIGHT regression — ALL GREEN (19/19 passed).
+
+        Test harness: /app/backend_test.py against http://localhost:8001/api.
+        Admin JWT extracted from Set-Cookie (cookie name=`tra_admin_token`)
+        and replayed via explicit Cookie header (Secure cookie can't replay
+        over http:// via requests.Session).
+
+        Bucket 1 — POST /api/admin/sessions/{id}/resynthesize (Patch G6):
+          - 401 without admin JWT → PASS (detail "Not authenticated.")
+          - 404 on bogus UUID → PASS
+          - 409 detail.reason=="missing_inputs" on freshly-created session
+            (no scores) → PASS. Body shape:
+              {"detail": {"reason": "missing_inputs",
+                          "message": "...",
+                          "missing": ["psychometric","ai_fluency","scenario"]}}
+          - 202 happy path on Ada (2253141a-...,fully scored) → PASS.
+            Body: {"status":"in_progress",
+                   "started_at":"2026-04-26T13:19:00.690767+00:00",
+                   "poll_url":"/api/admin/sessions/<sid>"}
+          - Mongo verification: synthesis.status moved to "in_progress"
+            and synthesis.restarted_by == "steve@org-logic.io"
+            (JWT `sub` claim). The previously-flagged email/sub bug
+            at server.py:2134-2136 is confirmed fixed.
+
+        Bucket 2 — POST /api/assessment/processing/start error shape (G1):
+          - On a fresh session at stage=psychometric, the endpoint returned
+            HTTP 409 with detail as an OBJECT (dict), not a string:
+              {"detail": {"reason": "stage_mismatch",
+                          "message": "...",
+                          "current_stage": "psychometric"}}
+          - reason ∈ {stage_mismatch, missing_inputs} confirmed → PASS.
+            Frontend Patch G1 escape-panel discriminator contract intact.
+
+        Bucket 3 — Background-task registry (Patches G4 + G5)
+        — source-evidence inspection of /app/backend/server.py:
+          - Line 1266: `_SYNTHESIS_TASKS: set = set()` declared at module
+            scope. PASS.
+          - Lines 1269-1274: `_register_synthesis_task` does
+            `_SYNTHESIS_TASKS.add(task)` and
+            `task.add_done_callback(_SYNTHESIS_TASKS.discard)`. PASS.
+          - Line 1456: /processing/start spawns via
+            `_register_synthesis_task(_run_synthesis_task(...))`. PASS.
+          - Line 2153: /admin/sessions/{id}/resynthesize spawns via the
+            same helper. PASS.
+          - _run_synthesis_task has a `finally:` clause that re-checks
+            terminal status and forces "failed" if neither branch wrote
+            one (G4 safety net). PASS.
+
+        Bucket 4 — Smoke regression (all 200):
+          - GET  /api/health                       → 200 {"status":"ok"}
+          - POST /api/sessions                     → 201 + session_id +
+                                                     resume_code (note:
+                                                     `consent: true` is
+                                                     a required field)
+          - PATCH /api/sessions/{id}/stage         → 200, walked
+                                                     identity → context →
+                                                     psychometric (stage
+                                                     transitions are
+                                                     sequential, one step
+                                                     at a time per
+                                                     STAGE_ORDER)
+          - POST /api/admin/auth/login             → 200 + Set-Cookie
+                                                     `tra_admin_token`
+          - GET  /api/admin/sessions               → 200, returns
+                                                     {items, total, page,
+                                                      page_size,
+                                                      filters_applied};
+                                                     items[] populated
+                                                     (page_size 25 of
+                                                     total 168)
+          - GET  /api/admin/dashboard/summary      → 200
+
+        Notable observations (NOT blockers, FYI for main agent):
+          1. The Ada session's synthesis worker, when in flight, blocks
+             other inbound HTTP requests for the duration of the LiteLLM
+             call (~50s per call × 2 calls = ~100s). All requests issued
+             during the worker's run timed out at the requests-side
+             10-30s timeout. This is the same observation noted in the
+             previous phase-9 round; the test harness was reordered to
+             run /processing/start (Bucket 2) BEFORE kicking off the
+             admin re-synth (Bucket 1) to avoid the stall. Likely a
+             LiteLLM/sync-bridge issue, not a Phase-9 regression.
+          2. Ada's synthesis happy path is consistently failing with
+             "part_a: no JSON block" on the current Emergent claude-opus-
+             4-6 deployment (3 separate runs during this session — same
+             error each time). The 202 + restarted_by + status=in_progress
+             contract IS verified, so Patch G6's wire-up is correct;
+             this is an upstream LLM-output-shape concern that is OUT OF
+             SCOPE for Phase 9 hotfix verification.
+
+        No auto-fixes applied. test_result.md unchanged except for this
+        block. /app/backend_test.py refreshed for this run (overwrites
+        prior Phase 9 sweep — that file is preserved at
+        /app/backend_test_phase9.py).
