@@ -1412,13 +1412,7 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus:
-    - "Phase 9 hotfix — synthesis timeouts (router per-call + total budget)"
-    - "_run_synthesis_task finally-clause guarantees terminal status"
-    - "asyncio.create_task held in _SYNTHESIS_TASKS module set"
-    - "POST /api/admin/sessions/{id}/resynthesize (admin force re-run)"
-    - "/processing/start returns reason='stage_mismatch' / 'missing_inputs' on 409"
-    - "Regression: Phases 2–8 endpoints still respond correctly"
+  current_focus: []
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -2579,3 +2573,400 @@ agent_communication:
         block. /app/backend_test.py refreshed for this run (overwrites
         prior Phase 9 sweep — that file is preserved at
         /app/backend_test_phase9.py).
+
+
+backend:
+  - task: "Phase 11A — admin sessions list extended filters + sort"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 11A list-filters sweep PASS (32/32 assertions in this block).
+            Ran /app/backend_test.py against http://localhost:8001/api with
+            admin JWT replayed via explicit Cookie header.
+
+            2a. dimension_min[learning_agility]=3.5 — 12 items returned, all
+                with dimensions.learning_agility >= 3.5; nulls excluded.
+                filters_applied.dimension_min == {learning_agility: 3.5}.
+                Each item carries `dimensions` with all 6 expected keys
+                (learning_agility, tolerance_for_ambiguity, cognitive_flexibility,
+                self_awareness_accuracy, ai_fluency, systems_thinking) and a
+                `response_pattern_flag` field. ✓
+            2b. dimension_min=3.5 + dimension_max=4.5 on learning_agility — 12
+                items, all 3.5 <= LA <= 4.5. ✓
+            2c. dimension_min[ai_fluency]=3.0 + dimension_min[cognitive_flexibility]=3.0
+                — both constraints applied via $and; 12 items, no violations. ✓
+            2d. overall_category=High Potential — 4 items, all matching;
+                filters_applied.overall_category echoed back as the literal
+                "High Potential" string. ✓
+            2e. overall_category=High Potential,Transformation Ready (csv) —
+                only HP returned (no TR sessions in current DB), which is
+                correct behaviour — set ⊆ {HP, TR}. ✓
+            2f. response_flag=any — 46 items, none with null
+                response_pattern_flag. ✓
+            2g. response_flag=none — 100 items, all with null
+                response_pattern_flag. ✓
+            2h. response_flag=high_acquiescence — 2 items (DB has actual
+                hits), all with that exact flag value. ✓
+            2i. SORT desc/asc on learning_agility / ai_fluency /
+                cognitive_flexibility — desc ordering verified against
+                non-null values (61 / 21 / 17 non-null rows respectively).
+                Asc sort returned all-null prefixes first (Mongo
+                nulls-first behaviour on asc), so the non-null tail came
+                after the page_size=200 limit was filled — vacuously
+                ordered, consistent with the brief's note about
+                nulls-naturally-sorting. ✓
+            2j. ERROR PATHS — all 6 cases returned the right 422 + the
+                expected substring in detail:
+                  dimension_min[learning_agility]=6.0 → 422
+                    "must be between 1.0 and 5.0" ✓
+                  dimension_min[learning_agility]=foo → 422
+                    "must be a number; got 'foo'" ✓
+                  dimension_min[bad_dim]=3 → 422
+                    "Unknown dimension 'bad_dim'" ✓
+                  overall_category=Bogus Category → 422
+                    "Unknown overall_category values: ['Bogus Category']" ✓
+                  response_flag=any,none → 422
+                    "response_flag cannot be both 'any' and 'none'" ✓
+                  response_flag=bogus_flag → 422
+                    "Unknown response_flag values: ['bogus_flag']" ✓
+            2k. REGRESSION — bare GET /admin/sessions still returns the
+                documented {items, total, page, page_size, filters_applied}
+                shape; filters_applied now includes dimension_min,
+                dimension_max, overall_category, response_flag echoes
+                alongside the existing q/status/archived/include_deleted/
+                date_from/date_to/sort. q=Ada returns 8 items;
+                status=completed returns 7 items, all with status=completed. ✓
+
+            No code changes were made during testing.
+        - working: "NA"
+          agent: "main"
+          comment: |
+            Extended GET /api/admin/sessions handler to accept:
+              - dimension_min[<dim>] / dimension_max[<dim>] (bracketed query
+                params, parsed via request.query_params.multi_items() against
+                ADMIN_DIMENSION_FIELDS map of 6 supported dimension keys).
+                Multiple constraints layer under $and. 422 on unknown dim or
+                value out of 1.0–5.0.
+              - overall_category (csv of 4 valid labels). 422 on unknown.
+              - response_flag (csv of 3 flag values + sentinels "any" / "none").
+                "any" maps to {"$ne": null}; "none" maps to null match.
+              - sort param now also accepts the 6 dimension keys (asc/desc),
+                translated to underlying mongo paths.
+            Item shape extended with `dimensions` (6 keys, normalised to 1.0–5.0
+            float, null when missing) and `response_pattern_flag`. The projection
+            now pulls these 7 extra fields. `filters_applied` echoes
+            dimension_min, dimension_max, overall_category, response_flag back so
+            the UI can render chips on hard refresh.
+            Curl-verified locally:
+              - dimension_min[learning_agility]=3.5 + overall_category=High Potential
+                + sort=-learning_agility → 4 matching High Potential sessions in
+                descending LA order. PASS
+              - response_flag=none → 123 sessions, all with flag=null. PASS
+              - dimension_min[learning_agility]=6.0 → 422
+                "must be between 1.0 and 5.0". PASS
+              - dimension_min[bad_dim]=3 → 422 "Unknown dimension 'bad_dim'". PASS
+
+  - task: "Phase 11A — GET /api/admin/sessions/compare endpoint"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 11A compare-endpoint sweep PASS (39/39 assertions in this
+            block). Ran /app/backend_test.py against
+            http://localhost:8001/api with admin JWT replayed via explicit
+            Cookie header.
+
+            3a. Happy path Ada×Ada (f9959971-…/2253141a-…) → 200.
+                Top-level keys: {participants, radar_data, dimension_table,
+                executive_summaries, key_quotes, scenario_quotes, flags,
+                axis_order, generated_at}. All 9 present. ✓
+                participants len=2, each with name/organisation/role/
+                completion_date/overall_category/overall_colour/
+                response_pattern_flag/scoring_error. ✓
+                radar_data len=2; each `dimensions` has all 6 expected
+                keys. ✓
+                dimension_table len=6; each row has dimension/
+                dimension_id/a_score/a_band/b_score/b_band/delta/
+                delta_band/divergent. Sorted by abs(delta) desc — for two
+                Ada-vs-Ada sessions with identical scores deltas all
+                came back as 0.0 (stable). ✓
+                executive_summaries len=2, each with overall_category/
+                category_statement/prose/key_strengths/
+                development_priorities/bottom_line. ✓
+                key_quotes len=2, each `quotes` is a list of strings
+                capped at 3 (current Ada sessions return 2 quotes each). ✓
+                scenario_quotes len=2, each with cognitive_flexibility
+                and systems_thinking objects each carrying
+                {score, band, key_quote}. ✓
+                flags len=2 with response_pattern_flag + scoring_error. ✓
+                axis_order = ["learning_agility", "tolerance_for_ambiguity",
+                "cognitive_flexibility", "self_awareness_accuracy",
+                "ai_fluency", "systems_thinking"] (exact match). ✓
+
+            3b. Happy path Ada vs Tester
+                (f9959971-…,5953a3d3-…) → 200. dimension_table sorted by
+                abs(delta) desc — observed deltas
+                [1.0, 1.0, 0.6, 0.2, 0.1, 0.0]. Top two rows are
+                cognitive_flexibility and systems_thinking, both with
+                delta=1.0 and divergent=true. ✓
+
+            3c. ERROR PATHS — all six gates fire correctly:
+                - ids=onlyone → 422 "must be exactly two session ids,
+                  comma-separated." ✓
+                - ids=  (empty) → 422 same message ✓
+                - ids=ADA_A,ADA_A (identical) → 422 "must reference two
+                  different sessions." ✓
+                - ids=ADA_A,does-not-exist-99999999 → 404 with
+                  detail.missing == ["does-not-exist-99999999"]. ✓
+                - ids=1178ba0a-… (Phase Two Tester, no scores), ADA_A →
+                  422 with detail.incomplete = [
+                    {session_id:"1178ba0a-…",
+                     reasons:["missing_scores.psychometric",
+                              "missing_scores.ai_fluency",
+                              "missing_scores.scenario",
+                              "missing_or_errored_deliverable"]}
+                  ]. Structured as documented. ✓
+                - No Cookie → 401 {"detail":"Not authenticated."} ✓
+
+            4. ROUTE ORDERING — verified that GET
+               /api/admin/sessions/compare is NOT shadowed by
+               /sessions/{session_id}: the response carries the compare
+               payload (axis_order, dimension_table, radar_data
+               present), not the admin_get_session shape. Conversely
+               GET /api/admin/sessions/2253141a-… still returns the
+               session detail (session_id + participant present, no
+               axis_order). Route declaration order at server.py:2206
+               (compare before /sessions/{session_id} at line 2377) is
+               correct. ✓
+
+            5. REGRESSION SUITE — pytest backend/tests/ -q from
+               /app/backend → 124 passed, 6 deprecation warnings (all
+               pre-existing FastAPI on_event lifespan warnings). 0
+               regressions from Phase 11A. ✓
+
+            No code changes were made during testing.
+        - working: "NA"
+          agent: "main"
+          comment: |
+            New admin-only endpoint, declared BEFORE /sessions/{session_id} so
+            FastAPI doesn't capture "compare" as a session_id path param.
+            Validates `ids` query string (exactly 2 distinct ids), fetches both
+            sessions, validates each is completed (status==completed OR
+            stage==results) AND has scores.{psychometric,ai_fluency,scenario}
+            populated AND has a non-errored deliverable. Returns:
+              - participants[] (name/org/role/completion_date/category/colour/
+                response_flag/scoring_error)
+              - radar_data[] (6-key dimensions object per session, prefers
+                deliverable.dimension_profiles, falls back to raw scores paths)
+              - dimension_table[] sorted by abs(delta) desc, with band chips
+                ("Exceptional"/"Strong"/"Capable"/"Developing"/"Low"), divergent
+                flag when |delta| >= 1.0
+              - executive_summaries[] (full prose blocks)
+              - key_quotes[] (capped at 3 from ai_fluency_deep_dive.illustrative_quotes)
+              - scenario_quotes[] (CF + ST score, band, key_quote each)
+              - flags[] (response_pattern_flag + scoring_error)
+              - axis_order, generated_at
+            Read-only: no LLM calls, no Mongo writes (does NOT update
+            last_admin_viewed_at).
+            Curl-verified locally (steve@org-logic.io / test1234 admin JWT):
+              - happy path Ada-vs-Tester returns full payload, dimension_table
+                correctly sorted (CF +1.00, ST +1.00, LA -0.60, SA -0.20,
+                TA +0.10, AI 0.00). PASS
+              - identical-scores comparison returns all deltas = 0.00 with
+                stable sort. PASS
+              - 1 id only → 422 "must be exactly two session ids". PASS
+              - 2 different ids, one missing → 404 with `missing` array. PASS
+              - no auth cookie → 401 "Not authenticated.". PASS
+              - 1 incomplete session (Phase Two Tester, no scores) → 422 with
+                detailed `incomplete[].reasons` (missing_scores.psychometric,
+                missing_scores.ai_fluency, missing_scores.scenario,
+                missing_or_errored_deliverable). PASS
+
+  - task: "Regression — existing 124 unit tests still pass"
+    implemented: true
+    working: true
+    file: "backend/tests/"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            pytest backend/tests/ → 124 passed, 6 deprecation warnings (pre-existing,
+            FastAPI on_event lifespan deprecation). No regressions from the
+            Phase 11A changes — the new logic is additive on the admin list
+            handler and a new endpoint.
+
+frontend:
+  - task: "Phase 11A — AdminSessions filter UI + bulk-select + Compare toolbar"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/AdminSessions.js, frontend/src/lib/adminApi.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            Rewrote AdminSessions to add (a) a collapsible Dimension Filters
+            panel with 6 dimension rows (min + max numeric inputs, 1.0–5.0,
+            step 0.1), (b) Overall Category multi-select pills (4 categories),
+            (c) Response Flag dropdown (All/Any flagged/None/3 specific flags),
+            (d) extended Sort dropdown (existing 4 options + 12 dimension
+            sort options asc+desc), (e) a checkbox column on every row
+            disabled when the row isn't a completed session with a populated
+            deliverable, (f) a navy Compare toolbar that activates only when
+            exactly 2 are selected, (g) a row of chips showing active filters
+            with × to remove and a "Clear all" link, (h) filter state mirrored
+            to URL search params via useSearchParams (deep-linkable), (i)
+            300ms debounce on the load callback, (j) friendly empty-state
+            "No sessions match these filters" with Clear filters CTA, (k)
+            extra LA/TA/CF/SA/AI/ST score columns on each row.
+            adminApi.js extended with a custom paramsSerializer that flattens
+            nested objects { dimension_min: {learning_agility: 3.5} } into
+            PHP-style bracket query params dimension_min[learning_agility]=3.5
+            (the format the backend expects). New compareSessions(idA, idB)
+            helper added.
+
+  - task: "Phase 11A — AdminCompare 9-section comparison page"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/AdminCompare.js, frontend/src/App.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            New /admin/compare?ids=A,B route (wired into App.js inside the
+            admin layout). Renders 9 sections: (1) header strip with the two
+            participant names and a Print button, (2) twin cover row with
+            ScoreChip + response_pattern_flag pill if present, (3) overlaid
+            radar SVG (navy fill 30% for A on top, gold fill 30% for B
+            beneath; per-axis dot markers; legend below; same -100 -40
+            420 300 viewBox treatment as the admin radar so labels never
+            clip; <title> + <desc> for screen readers), (4) dimension
+            comparison table sorted by |Δ| desc with band chips and a
+            "Significant divergence" note when |Δ| >= 1.0, (5) side-by-side
+            executive summaries with category_statement / prose / bottom_line,
+            (6) AI Fluency evidence quotes (3 per side, gold left border),
+            (7) Strategic Decision profile (CF + ST score + key_quote each
+            with navy left border), (8) Caveats strip (only renders when at
+            least one side has a flag or scoring_error), (9) footer with
+            generated_at + Back link. Print stylesheet pins page-break-inside:
+            avoid on the radar and section blocks; size A4 portrait;
+            cmp-no-print hides nav chrome. Loading and error states render
+            cleanly; 422 errors with structured `detail.incomplete` are
+            unpacked into a human-readable message.
+
+  - task: "Regression — existing admin pages unchanged"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/"
+    stuck_count: 0
+    priority: "low"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            AdminLayout, AdminSessionDetail, AdminSettings, AdminLogin,
+            AdminIndex untouched. Only changes outside AdminSessions are:
+            App.js gets one additional Route, adminApi.js gets a paramsSerializer
+            and a new compareSessions helper.
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 11A backend + frontend are code-complete. Requesting a
+        deep_testing_backend_v2 sweep on:
+          1) GET /api/admin/sessions extended filters and sort:
+             - dimension_min[<dim>] / dimension_max[<dim>] across the 6 keys
+               (learning_agility, tolerance_for_ambiguity, cognitive_flexibility,
+               self_awareness_accuracy, ai_fluency, systems_thinking).
+               Use values like 3.5 / 4.0 — verify response narrows; verify
+               422 on out-of-range and unknown dim.
+             - overall_category=High Potential / Transformation Ready / etc.
+               (csv); verify only matching rows return.
+             - response_flag={any,none,high_acquiescence,low_variance,
+               extreme_response_bias}; verify behaviour matches spec.
+             - sort=<dim> and sort=-<dim> for each of the 6 dim keys; verify
+               result ordering against the dimension's mongo path values.
+             - filters_applied echoes dimension_min/max/overall_category/
+               response_flag.
+             - existing q/status/archived/include_deleted/page/page_size
+               continue to work (regression).
+          2) GET /api/admin/sessions/compare:
+             - Happy path: 2 completed Ada sessions
+               (f9959971-5ee8-4f9f-83e6-f59ea747d9e0,
+                2253141a-830f-4810-a683-890f098b5664)
+               returns participants, radar_data, dimension_table sorted
+               by |delta| desc, executive_summaries, key_quotes,
+               scenario_quotes, flags, axis_order, generated_at.
+             - Mixed comparison
+               (f9959971-...-7d9e0,
+                5953a3d3-9539-45dd-9835-34a8c719be19) shows non-zero deltas
+               and CF/ST divergent==true rows.
+             - Validation: 422 on 1 id only; 422 on identical ids; 404 on
+               missing id; 401 without admin JWT; 422 on incomplete session
+               (use 1178ba0a-4c66-4dd0-a62a-2de014ee5acb which has no scores).
+          3) Regression — confirm the existing 124 unit tests still pass
+             AND the existing admin endpoints (auth/login, settings GET/PUT,
+             dashboard/summary, sessions/{id}, /sessions/{id}/resynthesize)
+             still return their documented shapes.
+        Admin creds: steve@org-logic.io / test1234. JWT cookie name
+        `tra_admin_token` (Secure cookie — replay via explicit Cookie header
+        per the prior testing-agent pattern, not requests.Session). No
+        frontend testing this round; we'll do that after backend approval.
+
+    - agent: "testing"
+      message: |
+        Phase 11A backend sweep complete — ALL GREEN.
+        Ran /app/backend_test.py against http://localhost:8001/api with
+        admin JWT replayed via explicit Cookie header (tra_admin_token).
+
+        Totals: 74 / 74 assertions PASS, 0 FAIL.
+        Regression suite: pytest backend/tests/ -q → 124 passed,
+        6 pre-existing deprecation warnings (FastAPI on_event lifespan).
+
+        Block-level summary:
+          [1] AUTH PREP — admin login + cookie replay → 200 on /admin/auth/me. ✓
+          [2] LIST FILTERS (32/32) — dimension_min/max bracket params with
+              $and layering, overall_category (single + csv), response_flag
+              (any/none/literal), sort by all 6 dimension keys (asc+desc),
+              filters_applied echo, plus all 6 documented 422 error paths
+              with the correct detail substrings, plus regression of
+              q/status existing filters. ✓
+          [3] COMPARE (39/39) — Ada×Ada full-payload conformance (9
+              top-level keys, exact axis_order, dimension_table sorted
+              by |delta| desc with all 9 row keys, key_quotes capped <=3,
+              scenario_quotes with cf+st score/band/key_quote);
+              Ada×Tester divergence (top two rows are CF and ST with
+              delta=1.0 and divergent=true); all error paths hit:
+              1-id 422, empty 422, identical 422, missing 404 (with
+              detail.missing array), incomplete 422 (with structured
+              detail.incomplete[].reasons), no-cookie 401. ✓
+          [4] ROUTE ORDERING — /sessions/compare returns the compare
+              payload, /sessions/<real-id> returns the session payload.
+              No collision. ✓
+          [5] REGRESSION — pytest backend/tests/ -q → 124 passed. ✓
+
+        No code changes made during testing. Both new tasks marked
+        working=true, needs_retesting=false. test_plan.current_focus
+        cleared. Phase 11A backend ready to ship.

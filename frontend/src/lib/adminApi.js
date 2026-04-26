@@ -42,8 +42,40 @@ export async function testFallback() {
 }
 
 // -------- Phase 8 admin endpoints -------- //
+// Custom serialiser so axios flattens nested filter objects into PHP-style
+// bracket query params: { dimension_min: { learning_agility: 3.5 } } becomes
+// `dimension_min[learning_agility]=3.5`. Matches the backend's expected
+// `dimension_min[<dim>]` syntax (Phase 11A).
+function _serializeAdminListParams(params) {
+  const sp = new URLSearchParams();
+  for (const [key, val] of Object.entries(params || {})) {
+    if (val === undefined || val === null || val === '') continue;
+    if ((key === 'dimension_min' || key === 'dimension_max') && typeof val === 'object') {
+      for (const [dim, v] of Object.entries(val)) {
+        if (v === null || v === undefined || v === '') continue;
+        sp.append(`${key}[${dim}]`, String(v));
+      }
+    } else if (Array.isArray(val)) {
+      // Standard csv flattening (used for status, overall_category, response_flag).
+      if (val.length) sp.append(key, val.join(','));
+    } else {
+      sp.append(key, String(val));
+    }
+  }
+  return sp.toString();
+}
+
 export async function listSessions(params = {}) {
-  const { data } = await adminApi.get('/sessions', { params });
+  const { data } = await adminApi.get('/sessions', {
+    params,
+    paramsSerializer: { serialize: _serializeAdminListParams },
+  });
+  return data;
+}
+export async function compareSessions(idA, idB) {
+  const { data } = await adminApi.get('/sessions/compare', {
+    params: { ids: `${idA},${idB}` },
+  });
   return data;
 }
 export async function getSession(sessionId) {

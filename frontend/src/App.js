@@ -16,6 +16,7 @@ import AdminIndex from './pages/admin/AdminIndex';
 import AdminSettings from './pages/admin/AdminSettings';
 import AdminSessions from './pages/admin/AdminSessions';
 import AdminSessionDetail from './pages/admin/AdminSessionDetail';
+import AdminCompare from './pages/admin/AdminCompare';
 
 function App() {
   return (
@@ -42,6 +43,7 @@ function App() {
           <Route path="settings" element={<AdminSettings />} />
           <Route path="sessions" element={<AdminSessions />} />
           <Route path="sessions/:sessionId" element={<AdminSessionDetail />} />
+          <Route path="compare" element={<AdminCompare />} />
         </Route>
       </Routes>
     </BrowserRouter>

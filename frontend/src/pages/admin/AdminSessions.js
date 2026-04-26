@@ -1,12 +1,50 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { Search, ChevronLeft, ChevronRight, Lock, Archive, ArchiveRestore, Trash2, RotateCcw, MoreHorizontal } from 'lucide-react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import {
+  Search, ChevronLeft, ChevronRight, Lock, Archive, ArchiveRestore, Trash2,
+  RotateCcw, MoreHorizontal, Sliders, X as IconX, GitCompare, Info,
+} from 'lucide-react';
 import {
   listSessions, patchSession, softDeleteSession, restoreSession, apiErrorMessage,
 } from '../../lib/adminApi';
 import ScoreChip from '../../components/admin/ScoreChip';
 
 const STATUS_OPTIONS = ['active', 'completed', 'failed', 'abandoned'];
+
+// Phase 11A — dimension filtering / sorting.
+const DIMENSIONS = [
+  { id: 'learning_agility',          label: 'Learning Agility' },
+  { id: 'tolerance_for_ambiguity',   label: 'Tolerance for Ambiguity' },
+  { id: 'cognitive_flexibility',     label: 'Cognitive Flexibility' },
+  { id: 'self_awareness_accuracy',   label: 'Self-Awareness Accuracy' },
+  { id: 'ai_fluency',                label: 'AI Fluency' },
+  { id: 'systems_thinking',          label: 'Systems Thinking' },
+];
+const CATEGORY_OPTIONS = [
+  'Transformation Ready',
+  'High Potential',
+  'Development Required',
+  'Limited Readiness',
+];
+const RESPONSE_FLAG_OPTIONS = [
+  { value: '',                       label: 'All' },
+  { value: 'any',                    label: 'Any flagged' },
+  { value: 'none',                   label: 'None (clean)' },
+  { value: 'high_acquiescence',      label: 'High acquiescence' },
+  { value: 'low_variance',           label: 'Low variance' },
+  { value: 'extreme_response_bias',  label: 'Extreme bias' },
+];
+const SORT_OPTIONS = [
+  { value: '-created_at',            label: 'Newest first' },
+  { value: 'created_at',             label: 'Oldest first' },
+  { value: '-completed_at',          label: 'Recently completed' },
+  { value: 'participant.name',       label: 'Name A–Z' },
+  // Dimension sorts (Phase 11A)
+  ...DIMENSIONS.flatMap((d) => ([
+    { value: `-${d.id}`, label: `${d.label} (high → low)` },
+    { value: d.id,       label: `${d.label} (low → high)` },
+  ])),
+];
 
 function fmtDate(iso) {
   if (!iso) return '—';
@@ -21,22 +59,120 @@ function fmtDuration(sec) {
   const h = Math.floor(m / 60), r = m % 60;
   return r ? `${h}h ${r}m` : `${h}h`;
 }
+function fmtScore(v) {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  if (Number.isNaN(n)) return '—';
+  return n.toFixed(1);
+}
+function isSessionCompleteForCompare(row) {
+  // Comparison requires a completed session with a populated deliverable.
+  return row.status === 'completed' && !!row.overall_category && !row.has_scoring_error;
+}
 
 export default function AdminSessions() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
+
+  // --- URL-driven filter state (Phase 11A: deep-linkable filters) ---
+  const initialState = useMemo(() => {
+    const dimMin = {};
+    const dimMax = {};
+    for (const [k, v] of searchParams.entries()) {
+      const mMin = k.match(/^dimension_min\[(\w+)\]$/);
+      const mMax = k.match(/^dimension_max\[(\w+)\]$/);
+      if (mMin) dimMin[mMin[1]] = v;
+      else if (mMax) dimMax[mMax[1]] = v;
+    }
+    return {
+      q: searchParams.get('q') || '',
+      sort: searchParams.get('sort') || '-created_at',
+      page: Math.max(1, parseInt(searchParams.get('page') || '1', 10) || 1),
+      statusFilter: (searchParams.get('status') || '').split(',').filter(Boolean),
+      archivedFilter: searchParams.get('archived') || '',
+      includeDeleted: searchParams.get('include_deleted') !== 'false',
+      categoryFilter: (searchParams.get('overall_category') || '').split(',').filter(Boolean),
+      responseFlag: searchParams.get('response_flag') || '',
+      dimMin,
+      dimMax,
+    };
+  }, []); // mount-only; subsequent URL writes go via setSearchParams below.
+
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
-  const [page, setPage] = useState(1);
+  const [page, setPage] = useState(initialState.page);
   const [pageSize] = useState(25);
-  const [q, setQ] = useState('');
-  const [statusFilter, setStatusFilter] = useState([]);
-  const [archivedFilter, setArchivedFilter] = useState('');   // '' | 'only' | 'exclude'
-  const [includeDeleted, setIncludeDeleted] = useState(true);
-  const [sort, setSort] = useState('-created_at');
+  const [q, setQ] = useState(initialState.q);
+  const [statusFilter, setStatusFilter] = useState(initialState.statusFilter);
+  const [archivedFilter, setArchivedFilter] = useState(initialState.archivedFilter);
+  const [includeDeleted, setIncludeDeleted] = useState(initialState.includeDeleted);
+  const [sort, setSort] = useState(initialState.sort);
+  const [categoryFilter, setCategoryFilter] = useState(initialState.categoryFilter);
+  const [responseFlag, setResponseFlag] = useState(initialState.responseFlag);
+  const [dimMin, setDimMin] = useState(initialState.dimMin);   // { learning_agility: '3.5', ... }
+  const [dimMax, setDimMax] = useState(initialState.dimMax);
+
+  const [dimPanelOpen, setDimPanelOpen] = useState(
+    Object.keys(initialState.dimMin).length + Object.keys(initialState.dimMax).length > 0
+  );
+  const [selectedIds, setSelectedIds] = useState(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [actionPending, setActionPending] = useState(null);
   const [menuOpenFor, setMenuOpenFor] = useState(null);
   const debounceRef = useRef(null);
+
+  // ---- URL <-> state sync (write only; read happens on mount).
+  useEffect(() => {
+    const next = new URLSearchParams();
+    if (q.trim()) next.set('q', q.trim());
+    if (sort && sort !== '-created_at') next.set('sort', sort);
+    if (page > 1) next.set('page', String(page));
+    if (statusFilter.length) next.set('status', statusFilter.join(','));
+    if (archivedFilter) next.set('archived', archivedFilter);
+    if (!includeDeleted) next.set('include_deleted', 'false');
+    if (categoryFilter.length) next.set('overall_category', categoryFilter.join(','));
+    if (responseFlag) next.set('response_flag', responseFlag);
+    for (const [dim, v] of Object.entries(dimMin)) {
+      if (v !== '' && v !== null && v !== undefined) next.set(`dimension_min[${dim}]`, String(v));
+    }
+    for (const [dim, v] of Object.entries(dimMax)) {
+      if (v !== '' && v !== null && v !== undefined) next.set(`dimension_max[${dim}]`, String(v));
+    }
+    setSearchParams(next, { replace: true });
+  }, [q, sort, page, statusFilter, archivedFilter, includeDeleted, categoryFilter, responseFlag, dimMin, dimMax, setSearchParams]);
+
+  // ---- Active filter chips (visible above the dim panel content).
+  const activeChips = useMemo(() => {
+    const out = [];
+    for (const d of DIMENSIONS) {
+      if (dimMin[d.id]) out.push({ key: `min-${d.id}`, label: `${d.label} ≥ ${dimMin[d.id]}`, kind: 'min', dim: d.id });
+      if (dimMax[d.id]) out.push({ key: `max-${d.id}`, label: `${d.label} ≤ ${dimMax[d.id]}`, kind: 'max', dim: d.id });
+    }
+    for (const c of categoryFilter) out.push({ key: `cat-${c}`, label: `Category: ${c}`, kind: 'cat', dim: c });
+    if (responseFlag) {
+      const opt = RESPONSE_FLAG_OPTIONS.find((o) => o.value === responseFlag);
+      out.push({ key: `flag-${responseFlag}`, label: `Flag: ${opt ? opt.label : responseFlag}`, kind: 'flag' });
+    }
+    return out;
+  }, [dimMin, dimMax, categoryFilter, responseFlag]);
+
+  function clearChip(c) {
+    if (c.kind === 'min') setDimMin((p) => { const n = { ...p }; delete n[c.dim]; return n; });
+    else if (c.kind === 'max') setDimMax((p) => { const n = { ...p }; delete n[c.dim]; return n; });
+    else if (c.kind === 'cat') setCategoryFilter((p) => p.filter((x) => x !== c.dim));
+    else if (c.kind === 'flag') setResponseFlag('');
+    setPage(1);
+  }
+  function clearAllFilters() {
+    setDimMin({}); setDimMax({});
+    setCategoryFilter([]);
+    setResponseFlag('');
+    setStatusFilter([]);
+    setArchivedFilter('');
+    setQ('');
+    setPage(1);
+  }
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -49,6 +185,18 @@ export default function AdminSessions() {
       if (q.trim()) params.q = q.trim();
       if (statusFilter.length) params.status = statusFilter.join(',');
       if (archivedFilter) params.archived = archivedFilter;
+      if (categoryFilter.length) params.overall_category = categoryFilter.join(',');
+      if (responseFlag) params.response_flag = responseFlag;
+      // Coerce string inputs to numbers (or skip empty ones).
+      const dmin = {}, dmax = {};
+      for (const [k, v] of Object.entries(dimMin)) {
+        if (v !== '' && !Number.isNaN(Number(v))) dmin[k] = Number(v);
+      }
+      for (const [k, v] of Object.entries(dimMax)) {
+        if (v !== '' && !Number.isNaN(Number(v))) dmax[k] = Number(v);
+      }
+      if (Object.keys(dmin).length) params.dimension_min = dmin;
+      if (Object.keys(dmax).length) params.dimension_max = dmax;
       const data = await listSessions(params);
       setItems(data.items || []);
       setTotal(data.total || 0);
@@ -57,9 +205,9 @@ export default function AdminSessions() {
     } finally {
       setLoading(false);
     }
-  }, [page, pageSize, sort, q, statusFilter, archivedFilter, includeDeleted]);
+  }, [page, pageSize, sort, q, statusFilter, archivedFilter, includeDeleted, categoryFilter, responseFlag, dimMin, dimMax]);
 
-  // Debounce search — re-load 300 ms after typing stops
+  // Debounce — re-load 300 ms after the last filter mutation
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(load, 300);
@@ -71,6 +219,27 @@ export default function AdminSessions() {
   const toggleStatus = (s) => {
     setStatusFilter((prev) => prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]);
     setPage(1);
+  };
+  const toggleCategory = (c) => {
+    setCategoryFilter((prev) => prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]);
+    setPage(1);
+  };
+
+  // ---- Bulk-select handling ----
+  const toggleSelect = (row) => {
+    if (!isSessionCompleteForCompare(row)) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(row.session_id)) next.delete(row.session_id);
+      else next.add(row.session_id);
+      return next;
+    });
+  };
+  const clearSelection = () => setSelectedIds(new Set());
+  const onCompare = () => {
+    if (selectedIds.size !== 2) return;
+    const ids = Array.from(selectedIds);
+    navigate(`/admin/compare?ids=${encodeURIComponent(ids.join(','))}`);
   };
 
   async function onArchiveToggle(row) {
@@ -99,6 +268,9 @@ export default function AdminSessions() {
     finally { setActionPending(null); }
   }
 
+  // -------------------------------------------------------------------- //
+  // Render
+  // -------------------------------------------------------------------- //
   return (
     <section>
       <div className="flex items-start justify-between mb-6">
@@ -120,17 +292,16 @@ export default function AdminSessions() {
               onChange={(e) => { setQ(e.target.value); setPage(1); }}
               placeholder="Search name, email, organisation, or session id"
               className="form-input pl-10 py-2.5 text-sm"
+              aria-label="Search sessions"
             />
           </div>
           <select
             value={sort}
             onChange={(e) => { setSort(e.target.value); setPage(1); }}
-            className="form-input py-2.5 text-sm max-w-[210px]"
+            className="form-input py-2.5 text-sm max-w-[260px]"
+            aria-label="Sort sessions"
           >
-            <option value="-created_at">Newest first</option>
-            <option value="created_at">Oldest first</option>
-            <option value="-completed_at">Recently completed</option>
-            <option value="participant.name">Name A–Z</option>
+            {SORT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>
         <div className="flex flex-wrap items-center gap-4 text-sm">
@@ -141,6 +312,7 @@ export default function AdminSessions() {
                 key={s}
                 type="button"
                 onClick={() => toggleStatus(s)}
+                aria-pressed={statusFilter.includes(s)}
                 className={
                   'text-xs uppercase tracking-wider2 px-2.5 py-1 border ' +
                   (statusFilter.includes(s)
@@ -156,6 +328,7 @@ export default function AdminSessions() {
               value={archivedFilter}
               onChange={(e) => { setArchivedFilter(e.target.value); setPage(1); }}
               className="form-input py-1.5 text-xs max-w-[150px]"
+              aria-label="Archived filter"
             >
               <option value="">All</option>
               <option value="only">Only archived</option>
@@ -172,7 +345,158 @@ export default function AdminSessions() {
             Show soft-deleted
           </label>
         </div>
+
+        {/* ---- Phase 11A: Category + Response flag row ---- */}
+        <div className="flex flex-wrap items-center gap-4 text-sm pt-2 border-t border-hairline/70">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="eyebrow text-muted">Category:</span>
+            {CATEGORY_OPTIONS.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => toggleCategory(c)}
+                aria-pressed={categoryFilter.includes(c)}
+                className={
+                  'text-xs uppercase tracking-wider2 px-2.5 py-1 border ' +
+                  (categoryFilter.includes(c)
+                    ? 'border-gold-dark bg-gold/15 text-navy'
+                    : 'border-hairline text-ink/70 hover:border-gold/40')
+                }
+              >{c}</button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="eyebrow text-muted">Response flag:</span>
+            <select
+              value={responseFlag}
+              onChange={(e) => { setResponseFlag(e.target.value); setPage(1); }}
+              className="form-input py-1.5 text-xs max-w-[200px]"
+              aria-label="Response flag filter"
+            >
+              {RESPONSE_FLAG_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+        </div>
+
+        {/* ---- Phase 11A: Dimension filters panel ---- */}
+        <div className="pt-2 border-t border-hairline/70">
+          <button
+            type="button"
+            onClick={() => setDimPanelOpen((v) => !v)}
+            className="inline-flex items-center gap-2 text-xs uppercase tracking-wider2 text-navy hover:text-gold-dark"
+            aria-expanded={dimPanelOpen}
+            aria-controls="dim-filter-panel"
+          >
+            <Sliders className="w-4 h-4" />
+            Dimension filters
+            <span className="text-muted normal-case tracking-normal">
+              ({activeChips.length ? `${activeChips.length} active` : 'min/max per dimension'})
+            </span>
+          </button>
+
+          {/* Active chips */}
+          {activeChips.length > 0 && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {activeChips.map((c) => (
+                <button
+                  key={c.key}
+                  type="button"
+                  onClick={() => clearChip(c)}
+                  className="inline-flex items-center gap-1 text-xs px-2.5 py-1 border border-hairline bg-mist hover:bg-hairline/40"
+                >
+                  {c.label}
+                  <IconX className="w-3 h-3" aria-hidden="true" />
+                  <span className="sr-only">Clear filter</span>
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={clearAllFilters}
+                className="text-xs text-terracotta uppercase tracking-wider2 hover:underline"
+              >Clear all</button>
+            </div>
+          )}
+
+          {dimPanelOpen && (
+            <div id="dim-filter-panel" className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {DIMENSIONS.map((d) => (
+                <div key={d.id} className="border border-hairline p-3 bg-mist/30">
+                  <label className="block text-xs uppercase tracking-wider2 text-navy mb-2">{d.label}</label>
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-muted">Min</span>
+                    <input
+                      type="number"
+                      step="0.1" min="1" max="5"
+                      value={dimMin[d.id] || ''}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setDimMin((p) => {
+                          const n = { ...p };
+                          if (v === '') delete n[d.id]; else n[d.id] = v;
+                          return n;
+                        });
+                        setPage(1);
+                      }}
+                      className="form-input py-1 px-2 w-16 text-xs"
+                      aria-label={`Minimum ${d.label}`}
+                      placeholder="1.0"
+                    />
+                    <span className="text-muted">Max</span>
+                    <input
+                      type="number"
+                      step="0.1" min="1" max="5"
+                      value={dimMax[d.id] || ''}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setDimMax((p) => {
+                          const n = { ...p };
+                          if (v === '') delete n[d.id]; else n[d.id] = v;
+                          return n;
+                        });
+                        setPage(1);
+                      }}
+                      className="form-input py-1 px-2 w-16 text-xs"
+                      aria-label={`Maximum ${d.label}`}
+                      placeholder="5.0"
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
+
+      {/* Compare toolbar (Phase 11A) */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center justify-between bg-navy text-white px-4 py-2.5 mb-3 text-sm">
+          <span>
+            <strong>{selectedIds.size}</strong> selected
+            {selectedIds.size === 1 && <span className="text-white/70 ml-2">· pick 1 more to compare</span>}
+            {selectedIds.size > 2 && <span className="text-white/70 ml-2">· pick exactly 2 to compare</span>}
+          </span>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={clearSelection}
+              className="text-xs uppercase tracking-wider2 text-white/80 hover:text-white"
+            >Clear</button>
+            <button
+              type="button"
+              onClick={onCompare}
+              disabled={selectedIds.size !== 2}
+              className={
+                'inline-flex items-center gap-2 px-3 py-1.5 text-xs uppercase tracking-wider2 border ' +
+                (selectedIds.size === 2
+                  ? 'bg-gold border-gold text-navy hover:bg-gold-dark hover:text-white'
+                  : 'border-white/30 text-white/40 cursor-not-allowed')
+              }
+            >
+              <GitCompare className="w-3.5 h-3.5" /> Compare
+            </button>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="text-sm text-terracotta mb-4">{error}</div>
@@ -183,13 +507,20 @@ export default function AdminSessions() {
           <caption className="sr-only">All sessions</caption>
           <thead>
             <tr className="text-[10px] uppercase tracking-wider2 text-muted border-b border-hairline">
+              <th scope="col" className="text-left px-3 py-2.5 font-medium w-8">
+                <span className="sr-only">Select for comparison</span>
+              </th>
               <th scope="col" className="text-left px-4 py-2.5 font-medium">Participant</th>
               <th scope="col" className="text-left px-4 py-2.5 font-medium">Organisation</th>
               <th scope="col" className="text-left px-4 py-2.5 font-medium">Stage</th>
               <th scope="col" className="text-left px-4 py-2.5 font-medium">Category</th>
-              <th scope="col" className="text-left px-4 py-2.5 font-medium">Started</th>
+              <th scope="col" className="text-left px-3 py-2.5 font-medium" title="Learning Agility">LA</th>
+              <th scope="col" className="text-left px-3 py-2.5 font-medium" title="Tolerance for Ambiguity">TA</th>
+              <th scope="col" className="text-left px-3 py-2.5 font-medium" title="Cognitive Flexibility">CF</th>
+              <th scope="col" className="text-left px-3 py-2.5 font-medium" title="Self-Awareness Accuracy">SA</th>
+              <th scope="col" className="text-left px-3 py-2.5 font-medium" title="AI Fluency">AI</th>
+              <th scope="col" className="text-left px-3 py-2.5 font-medium" title="Systems Thinking">ST</th>
               <th scope="col" className="text-left px-4 py-2.5 font-medium">Completed</th>
-              <th scope="col" className="text-left px-4 py-2.5 font-medium">Duration</th>
               <th scope="col" className="text-left px-4 py-2.5 font-medium">Status</th>
               <th scope="col" className="px-4 py-2.5 font-medium w-8" />
             </tr>
@@ -197,76 +528,106 @@ export default function AdminSessions() {
           <tbody>
             {loading && Array.from({ length: 6 }).map((_, i) => (
               <tr key={i} className="border-b border-hairline">
-                {Array.from({ length: 9 }).map((__, j) => (
-                  <td key={j} className="px-4 py-3"><div className="h-3 bg-hairline/70 animate-pulse w-16" /></td>
+                {Array.from({ length: 14 }).map((__, j) => (
+                  <td key={j} className="px-4 py-3"><div className="h-3 bg-hairline/70 animate-pulse w-12" /></td>
                 ))}
               </tr>
             ))}
             {!loading && items.length === 0 && (
               <tr>
-                <td colSpan={9} className="px-4 py-16 text-center">
-                  <p className="text-muted italic">No sessions match your filters.</p>
-                  <Link to="/" className="mt-3 inline-block text-sm text-navy hover:text-gold border-b border-transparent hover:border-gold">Start a demo session →</Link>
+                <td colSpan={14} className="px-4 py-16 text-center">
+                  <p className="text-muted italic">No sessions match these filters.</p>
+                  <button
+                    type="button"
+                    onClick={clearAllFilters}
+                    className="mt-3 inline-block text-sm text-navy hover:text-gold border-b border-transparent hover:border-gold"
+                  >Clear filters</button>
                 </td>
               </tr>
             )}
-            {!loading && items.map((r) => (
-              <tr key={r.session_id}
-                  className={'border-b border-hairline hover:bg-mist transition-colors ' + (r.archived ? 'bg-mist/40' : '')}>
-                <td className="px-4 py-3">
-                  <Link to={`/admin/sessions/${r.session_id}`}
-                        className="text-navy font-medium hover:text-gold">
-                    {r.redacted ? <span className="italic text-muted">(redacted)</span> : (r.participant?.name || '—')}
-                  </Link>
-                  {r.redacted && (
-                    <div className="text-[10px] uppercase tracking-wider2 text-terracotta mt-0.5">Soft-deleted</div>
-                  )}
-                  {r.participant?.email && !r.redacted && (
-                    <div className="text-[11px] text-muted">{r.participant.email}</div>
-                  )}
-                </td>
-                <td className="px-4 py-3 text-ink/80">{r.participant?.organisation || '—'}</td>
-                <td className="px-4 py-3 text-ink/80 capitalize">{r.stage || '—'}</td>
-                <td className="px-4 py-3"><ScoreChip colour={r.overall_colour} size="sm">{r.overall_category || 'n/a'}</ScoreChip></td>
-                <td className="px-4 py-3 text-ink/80">{fmtDate(r.created_at)}</td>
-                <td className="px-4 py-3 text-ink/80">{fmtDate(r.completed_at)}</td>
-                <td className="px-4 py-3 text-ink/80">{fmtDuration(r.duration_seconds)}</td>
-                <td className="px-4 py-3 text-ink/80">
-                  {r.archived ? <span className="inline-flex items-center gap-1 text-xs text-gold-dark"><Lock className="w-3 h-3" />Archived</span> : r.status}
-                </td>
-                <td className="px-2 py-3 relative text-right">
-                  <button type="button" className="p-1 hover:bg-hairline" onClick={() => setMenuOpenFor(menuOpenFor === r.session_id ? null : r.session_id)}>
-                    <MoreHorizontal className="w-4 h-4" />
-                  </button>
-                  {menuOpenFor === r.session_id && (
-                    <div className="absolute right-0 top-10 z-10 w-52 bg-white border border-hairline shadow-lg text-left text-sm"
-                         onMouseLeave={() => setMenuOpenFor(null)}>
-                      <Link to={`/admin/sessions/${r.session_id}`} className="block px-4 py-2 hover:bg-mist">View detail</Link>
-                      <button type="button" disabled={actionPending === r.session_id}
-                              onClick={() => onArchiveToggle(r)}
-                              className="w-full text-left px-4 py-2 hover:bg-mist flex items-center gap-2">
-                        {r.archived ? <ArchiveRestore className="w-3.5 h-3.5" /> : <Archive className="w-3.5 h-3.5" />}
-                        {r.archived ? 'Unarchive' : 'Archive'}
-                      </button>
-                      {!r.deleted_at && (
+            {!loading && items.map((r) => {
+              const dims = r.dimensions || {};
+              const canCompare = isSessionCompleteForCompare(r);
+              const isSelected = selectedIds.has(r.session_id);
+              return (
+                <tr key={r.session_id}
+                    className={'border-b border-hairline hover:bg-mist transition-colors ' + (r.archived ? 'bg-mist/40' : '') + (isSelected ? ' bg-gold/10' : '')}>
+                  <td className="px-3 py-3">
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={() => toggleSelect(r)}
+                      disabled={!canCompare}
+                      title={canCompare ? 'Select for comparison' : 'Comparison requires a completed session'}
+                      aria-label={canCompare ? `Select ${r.participant?.name || r.session_id} for comparison` : 'Comparison requires a completed session'}
+                      className="w-4 h-4 accent-navy disabled:opacity-30 disabled:cursor-not-allowed"
+                    />
+                  </td>
+                  <td className="px-4 py-3">
+                    <Link to={`/admin/sessions/${r.session_id}`}
+                          className="text-navy font-medium hover:text-gold">
+                      {r.redacted ? <span className="italic text-muted">(redacted)</span> : (r.participant?.name || '—')}
+                    </Link>
+                    {r.response_pattern_flag && (
+                      <span className="ml-2 inline-block text-[9px] uppercase tracking-wider2 text-terracotta border border-terracotta/40 px-1.5 py-0.5"
+                            title={`Response pattern flag: ${r.response_pattern_flag}`}>
+                        flagged
+                      </span>
+                    )}
+                    {r.redacted && (
+                      <div className="text-[10px] uppercase tracking-wider2 text-terracotta mt-0.5">Soft-deleted</div>
+                    )}
+                    {r.participant?.email && !r.redacted && (
+                      <div className="text-[11px] text-muted">{r.participant.email}</div>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-ink/80">{r.participant?.organisation || '—'}</td>
+                  <td className="px-4 py-3 text-ink/80 capitalize">{r.stage || '—'}</td>
+                  <td className="px-4 py-3"><ScoreChip colour={r.overall_colour} size="sm">{r.overall_category || 'n/a'}</ScoreChip></td>
+                  <td className="px-3 py-3 tabular-nums text-ink/80">{fmtScore(dims.learning_agility)}</td>
+                  <td className="px-3 py-3 tabular-nums text-ink/80">{fmtScore(dims.tolerance_for_ambiguity)}</td>
+                  <td className="px-3 py-3 tabular-nums text-ink/80">{fmtScore(dims.cognitive_flexibility)}</td>
+                  <td className="px-3 py-3 tabular-nums text-ink/80">{fmtScore(dims.self_awareness_accuracy)}</td>
+                  <td className="px-3 py-3 tabular-nums text-ink/80">{fmtScore(dims.ai_fluency)}</td>
+                  <td className="px-3 py-3 tabular-nums text-ink/80">{fmtScore(dims.systems_thinking)}</td>
+                  <td className="px-4 py-3 text-ink/80">{fmtDate(r.completed_at)}</td>
+                  <td className="px-4 py-3 text-ink/80">
+                    {r.archived ? <span className="inline-flex items-center gap-1 text-xs text-gold-dark"><Lock className="w-3 h-3" />Archived</span> : r.status}
+                  </td>
+                  <td className="px-2 py-3 relative text-right">
+                    <button type="button" className="p-1 hover:bg-hairline" onClick={() => setMenuOpenFor(menuOpenFor === r.session_id ? null : r.session_id)} aria-label="Row actions">
+                      <MoreHorizontal className="w-4 h-4" />
+                    </button>
+                    {menuOpenFor === r.session_id && (
+                      <div className="absolute right-0 top-10 z-10 w-52 bg-white border border-hairline shadow-lg text-left text-sm"
+                           onMouseLeave={() => setMenuOpenFor(null)}>
+                        <Link to={`/admin/sessions/${r.session_id}`} className="block px-4 py-2 hover:bg-mist">View detail</Link>
                         <button type="button" disabled={actionPending === r.session_id}
-                                onClick={() => onSoftDelete(r)}
-                                className="w-full text-left px-4 py-2 hover:bg-mist text-terracotta flex items-center gap-2">
-                          <Trash2 className="w-3.5 h-3.5" /> Soft delete
-                        </button>
-                      )}
-                      {r.deleted_at && (
-                        <button type="button" disabled={actionPending === r.session_id}
-                                onClick={() => onRestore(r)}
+                                onClick={() => onArchiveToggle(r)}
                                 className="w-full text-left px-4 py-2 hover:bg-mist flex items-center gap-2">
-                          <RotateCcw className="w-3.5 h-3.5" /> Restore
+                          {r.archived ? <ArchiveRestore className="w-3.5 h-3.5" /> : <Archive className="w-3.5 h-3.5" />}
+                          {r.archived ? 'Unarchive' : 'Archive'}
                         </button>
-                      )}
-                    </div>
-                  )}
-                </td>
-              </tr>
-            ))}
+                        {!r.deleted_at && (
+                          <button type="button" disabled={actionPending === r.session_id}
+                                  onClick={() => onSoftDelete(r)}
+                                  className="w-full text-left px-4 py-2 hover:bg-mist text-terracotta flex items-center gap-2">
+                            <Trash2 className="w-3.5 h-3.5" /> Soft delete
+                          </button>
+                        )}
+                        {r.deleted_at && (
+                          <button type="button" disabled={actionPending === r.session_id}
+                                  onClick={() => onRestore(r)}
+                                  className="w-full text-left px-4 py-2 hover:bg-mist flex items-center gap-2">
+                            <RotateCcw className="w-3.5 h-3.5" /> Restore
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

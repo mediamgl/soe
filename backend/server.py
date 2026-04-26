@@ -100,6 +100,30 @@ STAGE_SET = set(STAGE_ORDER)
 SIXTY_DAYS = timedelta(days=60)
 SETTINGS_DOC_ID = "global"
 
+# Phase 11A — admin reporting: filter / sort / compare.
+# Map from dimension key to the mongo dotted path that stores its 1.0–5.0 score.
+# Self-awareness uses the *claimed* mean (Doc 12 — true self-awareness accuracy
+# requires comparison with peer/manager 360s which is out of scope for the demo).
+ADMIN_DIMENSION_FIELDS: Dict[str, str] = {
+    "learning_agility":          "scores.psychometric.learning_agility.mean_1_5",
+    "tolerance_for_ambiguity":   "scores.psychometric.tolerance_for_ambiguity.mean_1_5",
+    "self_awareness_accuracy":   "scores.psychometric.self_awareness_claimed.mean_1_5",
+    "ai_fluency":                "scores.ai_fluency.overall_score",
+    "cognitive_flexibility":     "scores.scenario.cognitive_flexibility.score",
+    "systems_thinking":          "scores.scenario.systems_thinking.score",
+}
+ADMIN_OVERALL_CATEGORIES = {
+    "Transformation Ready",
+    "High Potential",
+    "Development Required",
+    "Limited Readiness",
+}
+ADMIN_RESPONSE_FLAG_VALUES = {
+    "high_acquiescence",
+    "low_variance",
+    "extreme_response_bias",
+}
+
 # Rate limits (sliding-window token buckets).
 RATE_LIMIT_SESSIONS_MAX = 10
 RATE_LIMIT_SESSIONS_WINDOW = 60 * 60  # 1 hour
@@ -1834,12 +1858,15 @@ async def test_fallback(current=Depends(require_admin)):
 # --------------------------------------------------------------------------- #
 @admin_router.get("/sessions", summary="List sessions (admin, search + filter + pagination)")
 async def admin_list_sessions(
+    request: Request,
     q: Optional[str] = None,
     status: Optional[str] = None,
     include_deleted: bool = True,
     archived: Optional[str] = None,  # "only" | "exclude" | None
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    overall_category: Optional[str] = None,  # csv of category labels
+    response_flag: Optional[str] = None,      # csv of flag values | "any" | "none"
     page: int = 1,
     page_size: int = 25,
     sort: str = "-created_at",
@@ -1886,14 +1913,79 @@ async def admin_list_sessions(
                 {"session_id": {"$regex": escaped, "$options": "i"}},
             ]
 
-    # --- sort parse
+    # --- Phase 11A: dimension score range filters.
+    # Accepts `dimension_min[<dim>]=3.5` and `dimension_max[<dim>]=4.5` query
+    # params (flat, bracketed). Multiple constraints on the same field are
+    # combined under a single per-path range clause. Sessions where the field
+    # is null (e.g. in-progress or scoring failed) are naturally excluded.
+    dim_constraints: List[Dict[str, Any]] = []
+    for raw_key, raw_val in request.query_params.multi_items():
+        m_min = re.fullmatch(r"dimension_min\[(\w+)\]", raw_key)
+        m_max = re.fullmatch(r"dimension_max\[(\w+)\]", raw_key)
+        if not (m_min or m_max):
+            continue
+        dim = (m_min or m_max).group(1)
+        path = ADMIN_DIMENSION_FIELDS.get(dim)
+        if not path:
+            raise HTTPException(status_code=422, detail=f"Unknown dimension '{dim}'.")
+        try:
+            v = float(raw_val)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422,
+                                detail=f"{raw_key} must be a number; got '{raw_val}'.")
+        if not (1.0 <= v <= 5.0):
+            raise HTTPException(status_code=422,
+                                detail=f"{raw_key} must be between 1.0 and 5.0.")
+        op = "$gte" if m_min else "$lte"
+        dim_constraints.append({path: {op: v}})
+    if dim_constraints:
+        # Use $and so multiple constraints on the same field don't clobber
+        # each other, and so they layer cleanly on top of any prior filters.
+        query.setdefault("$and", []).extend(dim_constraints)
+
+    # --- Phase 11A: overall_category filter (csv).
+    if overall_category:
+        cats = [c.strip() for c in overall_category.split(",") if c.strip()]
+        unknown = [c for c in cats if c not in ADMIN_OVERALL_CATEGORIES]
+        if unknown:
+            raise HTTPException(status_code=422,
+                                detail=f"Unknown overall_category values: {unknown}")
+        if cats:
+            query["deliverable.executive_summary.overall_category"] = {"$in": cats}
+
+    # --- Phase 11A: response_flag filter (csv with "any" / "none" sentinels).
+    if response_flag:
+        rf_path = "scores.psychometric.response_pattern_flag"
+        tokens = [t.strip() for t in response_flag.split(",") if t.strip()]
+        if "any" in tokens and "none" in tokens:
+            raise HTTPException(status_code=422,
+                                detail="response_flag cannot be both 'any' and 'none'.")
+        if "any" in tokens:
+            query[rf_path] = {"$nin": [None]}
+        elif "none" in tokens:
+            # Match both null and missing (Mongo treats $eq:null as either).
+            query[rf_path] = None
+        else:
+            unknown = [t for t in tokens if t not in ADMIN_RESPONSE_FLAG_VALUES]
+            if unknown:
+                raise HTTPException(status_code=422,
+                                    detail=f"Unknown response_flag values: {unknown}")
+            if tokens:
+                query[rf_path] = {"$in": tokens}
+
+    # --- sort parse (Phase 11A: dimension keys are also accepted).
     if sort.startswith("-"):
-        sort_field, direction = sort[1:], -1
+        sort_field_raw, direction = sort[1:], -1
     else:
-        sort_field, direction = sort, 1
-    allowed_sort = {"created_at", "completed_at", "participant.name", "status", "stage"}
-    if sort_field not in allowed_sort:
+        sort_field_raw, direction = sort, 1
+    allowed_meta_sort = {"created_at", "completed_at", "participant.name", "status", "stage"}
+    if sort_field_raw in allowed_meta_sort:
+        sort_field = sort_field_raw
+    elif sort_field_raw in ADMIN_DIMENSION_FIELDS:
+        sort_field = ADMIN_DIMENSION_FIELDS[sort_field_raw]
+    else:
         sort_field = "created_at"
+        direction = -1
 
     total = await sessions_coll.count_documents(query)
     skip = (page - 1) * page_size
@@ -1906,6 +1998,16 @@ async def admin_list_sessions(
         "deliverable.executive_summary.overall_category": 1,
         "deliverable.executive_summary.overall_colour": 1,
         "deliverable.scoring_error": 1,
+        # Phase 11A — surface dimension scores + response_flag so the admin
+        # list UI can show *why* a session matched a filter and so the row
+        # checkbox knows whether comparison is allowed.
+        "scores.psychometric.learning_agility.mean_1_5": 1,
+        "scores.psychometric.tolerance_for_ambiguity.mean_1_5": 1,
+        "scores.psychometric.self_awareness_claimed.mean_1_5": 1,
+        "scores.psychometric.response_pattern_flag": 1,
+        "scores.ai_fluency.overall_score": 1,
+        "scores.scenario.cognitive_flexibility.score": 1,
+        "scores.scenario.systems_thinking.score": 1,
     }).sort(sort_field, direction).skip(skip).limit(page_size)
 
     items: List[Dict[str, Any]] = []
@@ -1921,6 +2023,25 @@ async def admin_list_sessions(
                 dur_sec = int((datetime.fromisoformat(completed_at) - datetime.fromisoformat(created_at)).total_seconds())
             except Exception:
                 dur_sec = None
+        # Build dimension score summary (Phase 11A). Values are normalised to
+        # the 1.0–5.0 scale; missing fields stay None so the UI can render a
+        # dash rather than a 0.
+        psy = (doc.get("scores") or {}).get("psychometric") or {}
+        scn = (doc.get("scores") or {}).get("scenario") or {}
+        af = (doc.get("scores") or {}).get("ai_fluency") or {}
+        def _num(v: Any) -> Optional[float]:
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        dim_scores: Dict[str, Optional[float]] = {
+            "learning_agility":        _num((psy.get("learning_agility") or {}).get("mean_1_5")),
+            "tolerance_for_ambiguity": _num((psy.get("tolerance_for_ambiguity") or {}).get("mean_1_5")),
+            "self_awareness_accuracy": _num((psy.get("self_awareness_claimed") or {}).get("mean_1_5")),
+            "ai_fluency":              _num(af.get("overall_score")),
+            "cognitive_flexibility":   _num((scn.get("cognitive_flexibility") or {}).get("score")),
+            "systems_thinking":        _num((scn.get("systems_thinking") or {}).get("score")),
+        }
         items.append({
             "session_id": doc.get("session_id"),
             "participant": doc.get("participant") or {},
@@ -1938,7 +2059,29 @@ async def admin_list_sessions(
             "synthesis_status": synth.get("status"),
             "has_scoring_error": bool(deliv.get("scoring_error")),
             "duration_seconds": dur_sec,
+            # Phase 11A
+            "dimensions": dim_scores,
+            "response_pattern_flag": psy.get("response_pattern_flag"),
         })
+
+    # Snapshot of the dimension filters that were actually applied (so the UI
+    # can re-render the chips even if it lost local state, e.g. after a hard
+    # refresh on a deep-linked URL).
+    applied_dim_min: Dict[str, float] = {}
+    applied_dim_max: Dict[str, float] = {}
+    for raw_key, raw_val in request.query_params.multi_items():
+        m_min = re.fullmatch(r"dimension_min\[(\w+)\]", raw_key)
+        m_max = re.fullmatch(r"dimension_max\[(\w+)\]", raw_key)
+        if m_min and m_min.group(1) in ADMIN_DIMENSION_FIELDS:
+            try:
+                applied_dim_min[m_min.group(1)] = float(raw_val)
+            except (TypeError, ValueError):
+                pass
+        elif m_max and m_max.group(1) in ADMIN_DIMENSION_FIELDS:
+            try:
+                applied_dim_max[m_max.group(1)] = float(raw_val)
+            except (TypeError, ValueError):
+                pass
 
     return {
         "items": items,
@@ -1950,7 +2093,284 @@ async def admin_list_sessions(
             "include_deleted": include_deleted,
             "date_from": date_from, "date_to": date_to,
             "sort": sort,
+            # Phase 11A
+            "dimension_min": applied_dim_min,
+            "dimension_max": applied_dim_max,
+            "overall_category": overall_category,
+            "response_flag": response_flag,
         },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Phase 11A — Admin session comparison (Option 1).
+# Reads two completed sessions and returns a structured payload for a
+# side-by-side admin report. Read-only; no LLM calls; no Mongo writes.
+# --------------------------------------------------------------------------- #
+COMPARE_AXIS_ORDER: List[str] = [
+    "learning_agility",
+    "tolerance_for_ambiguity",
+    "cognitive_flexibility",
+    "self_awareness_accuracy",
+    "ai_fluency",
+    "systems_thinking",
+]
+COMPARE_DIM_NAMES: Dict[str, str] = {
+    "learning_agility": "Learning Agility",
+    "tolerance_for_ambiguity": "Tolerance for Ambiguity",
+    "cognitive_flexibility": "Cognitive Flexibility",
+    "self_awareness_accuracy": "Self-Awareness Accuracy",
+    "ai_fluency": "AI Fluency",
+    "systems_thinking": "Systems Thinking",
+}
+
+
+def _compare_band_for(score: Optional[float]) -> Optional[str]:
+    """Map a 1.0–5.0 dimension score to a verbal band, mirroring the
+    psychometric service so radar / table chips look identical."""
+    if score is None:
+        return None
+    s = float(score)
+    if s >= 4.5:
+        return "Exceptional"
+    if s >= 4.0:
+        return "Strong"
+    if s >= 3.5:
+        return "Capable"
+    if s >= 2.5:
+        return "Developing"
+    return "Low"
+
+
+def _extract_compare_dimensions(doc: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Pull all six dimension scores from a single session doc, preferring
+    `deliverable.dimension_profiles` when available (already normalised) and
+    falling back to raw `scores.*` paths."""
+    out: Dict[str, Optional[float]] = {k: None for k in COMPARE_AXIS_ORDER}
+    profiles = ((doc.get("deliverable") or {}).get("dimension_profiles") or [])
+    for p in profiles:
+        dim_id = p.get("dimension_id")
+        if dim_id in out:
+            try:
+                out[dim_id] = float(p.get("score"))
+            except (TypeError, ValueError):
+                pass
+    # Fill any remaining None from raw paths.
+    raw_paths = {
+        "learning_agility":         ("scores", "psychometric", "learning_agility", "mean_1_5"),
+        "tolerance_for_ambiguity":  ("scores", "psychometric", "tolerance_for_ambiguity", "mean_1_5"),
+        "self_awareness_accuracy":  ("scores", "psychometric", "self_awareness_claimed", "mean_1_5"),
+        "ai_fluency":               ("scores", "ai_fluency", "overall_score"),
+        "cognitive_flexibility":    ("scores", "scenario", "cognitive_flexibility", "score"),
+        "systems_thinking":         ("scores", "scenario", "systems_thinking", "score"),
+    }
+    for dim, path in raw_paths.items():
+        if out.get(dim) is not None:
+            continue
+        node: Any = doc
+        ok = True
+        for seg in path:
+            if not isinstance(node, dict):
+                ok = False
+                break
+            node = node.get(seg)
+            if node is None:
+                ok = False
+                break
+        if ok:
+            try:
+                out[dim] = float(node)
+            except (TypeError, ValueError):
+                out[dim] = None
+    return out
+
+
+def _compare_session_summary(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """One-row summary used in `participants` and `flags` sections."""
+    deliv = doc.get("deliverable") or {}
+    es = deliv.get("executive_summary") or {}
+    psy = (doc.get("scores") or {}).get("psychometric") or {}
+    return {
+        "session_id": doc.get("session_id"),
+        "name": (doc.get("participant") or {}).get("name"),
+        "organisation": (doc.get("participant") or {}).get("organisation"),
+        "role": (doc.get("participant") or {}).get("role"),
+        "completion_date": doc.get("completed_at"),
+        "overall_category": es.get("overall_category"),
+        "overall_colour": es.get("overall_colour"),
+        "response_pattern_flag": psy.get("response_pattern_flag"),
+        "scoring_error": bool(deliv.get("scoring_error")),
+    }
+
+
+@admin_router.get(
+    "/sessions/compare",
+    summary="Side-by-side comparison data for exactly two completed sessions",
+)
+async def admin_compare_sessions(
+    ids: str,
+    current=Depends(require_admin),
+):
+    # --- Validate `ids` (exactly 2 unique session ids).
+    raw_ids = [i.strip() for i in (ids or "").split(",") if i.strip()]
+    if len(raw_ids) != 2:
+        raise HTTPException(
+            status_code=422,
+            detail="`ids` must be exactly two session ids, comma-separated.",
+        )
+    if raw_ids[0] == raw_ids[1]:
+        raise HTTPException(
+            status_code=422,
+            detail="`ids` must reference two different sessions.",
+        )
+
+    # --- Fetch both sessions.
+    docs: Dict[str, Optional[Dict[str, Any]]] = {sid: None for sid in raw_ids}
+    cursor = sessions_coll.find({"session_id": {"$in": raw_ids}}, {"_id": 0})
+    async for d in cursor:
+        if d.get("session_id") in docs:
+            docs[d["session_id"]] = d
+    missing = [sid for sid, d in docs.items() if d is None]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": "One or more sessions not found.", "missing": missing},
+        )
+
+    ordered_docs: List[Dict[str, Any]] = [docs[sid] for sid in raw_ids]  # type: ignore[list-item]
+
+    # --- Validate completion + score blocks.
+    incomplete: List[Dict[str, Any]] = []
+    for d in ordered_docs:
+        scores = d.get("scores") or {}
+        deliv = d.get("deliverable") or {}
+        reasons: List[str] = []
+        if d.get("status") != "completed" and d.get("stage") != "results":
+            reasons.append("not_completed")
+        for k in ("psychometric", "ai_fluency", "scenario"):
+            if not scores.get(k):
+                reasons.append(f"missing_scores.{k}")
+        if not deliv or deliv.get("scoring_error"):
+            reasons.append("missing_or_errored_deliverable")
+        if reasons:
+            incomplete.append({
+                "session_id": d.get("session_id"),
+                "reasons": reasons,
+            })
+    if incomplete:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Comparison requires both sessions to be completed with full scores and a deliverable.",
+                "incomplete": incomplete,
+            },
+        )
+
+    # --- Build participants & radar_data.
+    participants = [_compare_session_summary(d) for d in ordered_docs]
+    radar_data = [
+        {"session_id": d.get("session_id"), "dimensions": _extract_compare_dimensions(d)}
+        for d in ordered_docs
+    ]
+
+    # --- Build the per-dimension comparison table, sorted by abs(delta) desc.
+    a_dims = radar_data[0]["dimensions"]
+    b_dims = radar_data[1]["dimensions"]
+    table_rows: List[Dict[str, Any]] = []
+    for dim_id in COMPARE_AXIS_ORDER:
+        a_score = a_dims.get(dim_id)
+        b_score = b_dims.get(dim_id)
+        if a_score is None or b_score is None:
+            delta = None
+            divergent = False
+        else:
+            delta = round(b_score - a_score, 2)
+            divergent = abs(delta) >= 1.0
+        table_rows.append({
+            "dimension_id": dim_id,
+            "dimension": COMPARE_DIM_NAMES[dim_id],
+            "a_score": a_score,
+            "a_band": _compare_band_for(a_score),
+            "b_score": b_score,
+            "b_band": _compare_band_for(b_score),
+            "delta": delta,
+            "delta_band": _compare_band_for(abs(delta)) if delta is not None else None,
+            "divergent": divergent,
+        })
+    table_rows.sort(
+        key=lambda r: abs(r["delta"]) if r["delta"] is not None else -1,
+        reverse=True,
+    )
+
+    # --- Executive summaries.
+    executive_summaries = []
+    for d in ordered_docs:
+        es = ((d.get("deliverable") or {}).get("executive_summary") or {})
+        executive_summaries.append({
+            "session_id": d.get("session_id"),
+            "overall_category": es.get("overall_category"),
+            "overall_colour": es.get("overall_colour"),
+            "category_statement": es.get("category_statement"),
+            "prose": es.get("prose"),
+            "key_strengths": es.get("key_strengths") or [],
+            "development_priorities": es.get("development_priorities") or [],
+            "bottom_line": es.get("bottom_line"),
+        })
+
+    # --- AI fluency illustrative quotes.
+    key_quotes = []
+    for d in ordered_docs:
+        afd = ((d.get("deliverable") or {}).get("ai_fluency_deep_dive") or {})
+        quotes = afd.get("illustrative_quotes") or []
+        # cap at 3 per side per the brief
+        key_quotes.append({
+            "session_id": d.get("session_id"),
+            "quotes": [str(q) for q in quotes[:3] if isinstance(q, str)],
+        })
+
+    # --- Strategic Decision profile (CF + ST scenarios with scoring evidence).
+    scenario_quotes = []
+    for d in ordered_docs:
+        scn = (d.get("scores") or {}).get("scenario") or {}
+        cf = scn.get("cognitive_flexibility") or {}
+        st = scn.get("systems_thinking") or {}
+        cf_evidence = cf.get("evidence") or {}
+        st_evidence = st.get("evidence") or {}
+        scenario_quotes.append({
+            "session_id": d.get("session_id"),
+            "cognitive_flexibility": {
+                "score": cf.get("score"),
+                "band": _compare_band_for(cf.get("score")),
+                "key_quote": cf_evidence.get("key_quote"),
+            },
+            "systems_thinking": {
+                "score": st.get("score"),
+                "band": _compare_band_for(st.get("score")),
+                "key_quote": st_evidence.get("key_quote"),
+            },
+        })
+
+    # --- Caveats.
+    flags = []
+    for d in ordered_docs:
+        psy = (d.get("scores") or {}).get("psychometric") or {}
+        deliv = d.get("deliverable") or {}
+        flags.append({
+            "session_id": d.get("session_id"),
+            "response_pattern_flag": psy.get("response_pattern_flag"),
+            "scoring_error": bool(deliv.get("scoring_error")),
+        })
+
+    return {
+        "participants": participants,
+        "radar_data": radar_data,
+        "dimension_table": table_rows,
+        "executive_summaries": executive_summaries,
+        "key_quotes": key_quotes,
+        "scenario_quotes": scenario_quotes,
+        "flags": flags,
+        "axis_order": COMPARE_AXIS_ORDER,
+        "generated_at": _now_iso(),
     }
 
 
