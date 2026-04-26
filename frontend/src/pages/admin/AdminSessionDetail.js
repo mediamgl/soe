@@ -871,7 +871,7 @@ function ScenarioTab({ doc, engagement }) {
           <h2 className="eyebrow text-navy mb-3">Time on each phase</h2>
           <ScenarioPhaseBars phases={phases} />
           <div className="mt-4 flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
-            <span><strong className="text-navy">Total:</strong> {fmtDurationMin(summary.total_actual_ms)}</span>
+            <span><strong className="text-navy">Total time:</strong> {fmtDurationMin(summary.total_actual_ms)}</span>
             <span className="text-muted">target {fmtDurationMin(summary.total_target_ms)}</span>
             {summary.most_engaged_phase && (
               <span>
