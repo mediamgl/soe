@@ -2131,7 +2131,9 @@ async def admin_resynthesize(session_id: str, current=Depends(require_admin)):
         })
 
     now = _now_iso()
-    admin_email = (current or {}).get("email") if isinstance(current, dict) else None
+    # JWT payload stores the admin email under the standard `sub` claim
+    # (see admin auth above). Using .get("email") would silently return None.
+    admin_email = (current or {}).get("sub") if isinstance(current, dict) else None
     await sessions_coll.update_one(
         {"session_id": session_id},
         {"$set": {
