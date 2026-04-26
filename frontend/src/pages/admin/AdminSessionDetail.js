@@ -6,7 +6,7 @@ import {
   FileCheck2, RefreshCw,
 } from 'lucide-react';
 import {
-  getSession, patchSession, softDeleteSession, restoreSession, resynthesize,
+  getSession, getEngagement, patchSession, softDeleteSession, restoreSession, resynthesize,
   conversationDownloadUrl, deliverableDownloadUrl, apiErrorMessage,
 } from '../../lib/adminApi';
 import ScoreChip from '../../components/admin/ScoreChip';
@@ -41,6 +41,7 @@ export default function AdminSessionDetail() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
   const [doc, setDoc] = useState(null);
+  const [engagement, setEngagement] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState('overview');
@@ -56,6 +57,15 @@ export default function AdminSessionDetail() {
       const d = await getSession(sessionId);
       setDoc(d);
       setNotes(d.admin_notes || '');
+      // Phase 11B — engagement analytics, fetched in parallel. Failure is
+      // non-fatal: the tabs gracefully fall back to the legacy view if it's
+      // null.
+      try {
+        const eg = await getEngagement(sessionId);
+        setEngagement(eg);
+      } catch {
+        setEngagement(null);
+      }
     } catch (e) {
       setError(apiErrorMessage(e, 'Could not load session.'));
     } finally {
@@ -289,9 +299,9 @@ export default function AdminSessionDetail() {
 
       <div>
         {activeTab === 'overview' && <OverviewTab doc={doc} />}
-        {activeTab === 'psychometric' && <PsychometricTab doc={doc} />}
-        {activeTab === 'ai' && <AIDiscussionTab doc={doc} />}
-        {activeTab === 'scenario' && <ScenarioTab doc={doc} />}
+        {activeTab === 'psychometric' && <PsychometricTab doc={doc} engagement={engagement?.psychometric} />}
+        {activeTab === 'ai' && <AIDiscussionTab doc={doc} engagement={engagement?.ai_discussion} />}
+        {activeTab === 'scenario' && <ScenarioTab doc={doc} engagement={engagement?.scenario} />}
         {activeTab === 'deliverable' && <DeliverableTab doc={doc} />}
         {activeTab === 'timeline' && <TimelineTab doc={doc} />}
         {activeTab === 'notes' && (
@@ -451,19 +461,35 @@ function RadarChart({ profiles }) {
 }
 
 // -------- Psychometric Tab -------- //
-function PsychometricTab({ doc }) {
+// Phase 11B — palette for response_time_band → heatmap cell colour.
+const RT_BAND_COLOURS = {
+  fast:        { bg: '#cfd8e3', fg: '#1e3a5f', label: 'Fast' },
+  normal:      { bg: '#1e3a5f', fg: '#ffffff', label: 'Normal' },
+  slow:        { bg: '#d4a84b', fg: '#1e3a5f', label: 'Slow' },
+  deliberated: { bg: '#b94c3a', fg: '#ffffff', label: 'Deliberated' },
+};
+function fmtSec(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const s = Math.round(ms / 100) / 10;  // 1 decimal sec
+  return `${s.toFixed(1)}s`;
+}
+
+function PsychometricTab({ doc, engagement }) {
   const scores = doc.scores?.psychometric || {};
   const la = scores.learning_agility || {};
   const ta = scores.tolerance_for_ambiguity || {};
-  const answers = doc.answers || [];
-  const [sortBy, setSortBy] = useState('order');
+  const items = engagement?.items || [];
+  const summary = engagement?.summary || null;
+  const [sortBy, setSortBy] = useState('order');   // 'order' | 'rt_asc' | 'rt_desc'
 
-  const sorted = useMemo(() => {
-    const arr = [...answers];
-    if (sortBy === 'rt') arr.sort((a, b) => (b.response_time_ms || 0) - (a.response_time_ms || 0));
-    else arr.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
-    return arr;
-  }, [answers, sortBy]);
+  const sortedItems = useMemo(() => {
+    if (sortBy === 'rt_desc') return [...items].sort((a, b) => (b.response_time_ms || 0) - (a.response_time_ms || 0));
+    if (sortBy === 'rt_asc')  return [...items].sort((a, b) => (a.response_time_ms || 0) - (b.response_time_ms || 0));
+    return items;
+  }, [items, sortBy]);
+
+  const fastest3 = (summary?.fastest_3 || []).map((id) => items.find((x) => x.item_id === id)).filter(Boolean);
+  const slowest3 = (summary?.slowest_3 || []).map((id) => items.find((x) => x.item_id === id)).filter(Boolean);
 
   return (
     <div id="panel-psychometric" className="space-y-6">
@@ -471,39 +497,154 @@ function PsychometricTab({ doc }) {
         <ScoreCard title="Learning Agility" mean={la.mean_1_5} band={la.band} subscales={la.subscales} />
         <ScoreCard title="Tolerance for Ambiguity" mean={ta.mean_1_5} band={ta.band} subscales={ta.subscales} />
       </div>
+
+      {/* ---- Phase 11B: engagement summary strip + heatmap ---- */}
+      {summary && items.length > 0 && (
+        <div className="bg-white border border-hairline border-t-[3px] border-t-gold p-5">
+          <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+            <h2 className="eyebrow text-navy mr-2">Response engagement</h2>
+            <span><strong className="text-navy">Median:</strong> {fmtSec(summary.median_ms)}</span>
+            <span className="text-muted">25th–75th: {fmtSec(summary.p25_ms)}–{fmtSec(summary.p75_ms)}</span>
+            <span><strong className="text-terracotta">{summary.deliberated_count}</strong> item{summary.deliberated_count === 1 ? '' : 's'} deliberated</span>
+          </div>
+
+          <ResponseTimeHeatmap items={items} />
+
+          {/* Legend */}
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-[10px] uppercase tracking-wider2">
+            {Object.entries(RT_BAND_COLOURS).map(([k, v]) => (
+              <span key={k} className="inline-flex items-center gap-1.5">
+                <span className="inline-block w-3 h-3" style={{ background: v.bg }} aria-hidden="true" />
+                <span className="text-muted">{v.label}</span>
+              </span>
+            ))}
+            <span className="ml-auto text-muted normal-case tracking-normal italic">
+              Bands relative to participant's own median ({fmtSec(summary.median_ms)})
+            </span>
+          </div>
+
+          {/* Fastest + Slowest lists */}
+          <div className="mt-5 grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <h3 className="eyebrow text-navy mb-2">Fastest 3</h3>
+              <ul className="space-y-1.5 text-sm">
+                {fastest3.map((it) => (
+                  <li key={it.item_id} className="flex items-baseline gap-2">
+                    <span className="font-mono text-[11px] text-navy w-12 flex-shrink-0">{it.item_id}</span>
+                    <span className="flex-1 text-ink/80 leading-snug">{it.text}</span>
+                    <span className="text-muted text-xs tabular-nums whitespace-nowrap">{fmtSec(it.response_time_ms)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div>
+              <h3 className="eyebrow text-navy mb-2">Most deliberated</h3>
+              <ul className="space-y-1.5 text-sm">
+                {slowest3.map((it) => (
+                  <li key={it.item_id} className="flex items-baseline gap-2">
+                    <span className="font-mono text-[11px] text-navy w-12 flex-shrink-0">{it.item_id}</span>
+                    <span className="flex-1 text-ink/80 leading-snug">{it.text}</span>
+                    <span className="text-muted text-xs tabular-nums whitespace-nowrap">{fmtSec(it.response_time_ms)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white border border-hairline p-5">
         <div className="flex items-center justify-between mb-3">
           <h2 className="eyebrow text-navy">All 20 responses</h2>
-          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="form-input py-1.5 text-xs max-w-[180px]">
-            <option value="order">Sort: position</option>
-            <option value="rt">Sort: response time (desc)</option>
+          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="form-input py-1.5 text-xs max-w-[220px]" aria-label="Sort responses">
+            <option value="order">Sort: display position</option>
+            <option value="rt_desc">Sort: response time (slow → fast)</option>
+            <option value="rt_asc">Sort: response time (fast → slow)</option>
           </select>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-[10px] uppercase tracking-wider2 text-muted border-b border-hairline">
-                <th className="text-left px-3 py-2">#</th>
-                <th className="text-left px-3 py-2">Scale</th>
-                <th className="text-left px-3 py-2">Subscale</th>
-                <th className="text-left px-3 py-2">Value (1–6)</th>
-                <th className="text-left px-3 py-2">Response time</th>
+                <th scope="col" className="text-left px-3 py-2 w-8">#</th>
+                <th scope="col" className="text-left px-3 py-2">Item</th>
+                <th scope="col" className="text-left px-3 py-2">Scale</th>
+                <th scope="col" className="text-left px-3 py-2">Subscale</th>
+                <th scope="col" className="text-left px-3 py-2">Value</th>
+                <th scope="col" className="text-left px-3 py-2">Response time</th>
+                <th scope="col" className="text-left px-3 py-2">Band</th>
               </tr>
             </thead>
             <tbody>
-              {sorted.length === 0 && <tr><td colSpan={5} className="px-3 py-5 text-muted italic text-sm">No responses on file.</td></tr>}
-              {sorted.map((a, i) => (
-                <tr key={a.item_id || i} className="border-b border-hairline">
-                  <td className="px-3 py-2 text-ink/70">{(a.position ?? i) + 1}</td>
-                  <td className="px-3 py-2 text-ink/80">{a.scale || '—'}</td>
-                  <td className="px-3 py-2 text-ink/80">{a.subscale || '—'}</td>
-                  <td className="px-3 py-2 text-navy font-medium">{a.value ?? '—'}</td>
-                  <td className="px-3 py-2 text-ink/80">{fmtDuration(a.response_time_ms)}</td>
-                </tr>
-              ))}
+              {sortedItems.length === 0 && <tr><td colSpan={7} className="px-3 py-5 text-muted italic text-sm">No responses on file.</td></tr>}
+              {sortedItems.map((it, i) => {
+                const c = RT_BAND_COLOURS[it.response_time_band] || RT_BAND_COLOURS.normal;
+                return (
+                  <tr key={it.item_id || i} className="border-b border-hairline">
+                    <td className="px-3 py-2 text-ink/70 tabular-nums">{i + 1}</td>
+                    <td className="px-3 py-2">
+                      <div className="font-mono text-[11px] text-navy">{it.item_id}{it.is_reverse_keyed ? <span className="text-gold-dark">R</span> : ''}</div>
+                      <div className="text-xs text-ink/70 leading-snug max-w-[420px]">{it.text}</div>
+                    </td>
+                    <td className="px-3 py-2 text-ink/80">{it.scale || '—'}</td>
+                    <td className="px-3 py-2 text-ink/80 capitalize">{it.subscale ? it.subscale.replace(/_/g, ' ') : '—'}</td>
+                    <td className="px-3 py-2 text-navy font-medium tabular-nums">{it.value ?? '—'}</td>
+                    <td className="px-3 py-2 text-ink/80 tabular-nums">{fmtSec(it.response_time_ms)}</td>
+                    <td className="px-3 py-2">
+                      <span className="inline-block text-[10px] uppercase tracking-wider2 px-2 py-0.5"
+                            style={{ background: c.bg, color: c.fg }}>
+                        {c.label}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// 20-cell heatmap — each cell is a square with the item id and tooltip.
+// LA block + thin gold divider + TA block reflect the actual scale grouping;
+// items inside each scale render in DISPLAY order (i.e. the participant's
+// randomised order), per the brief.
+function ResponseTimeHeatmap({ items }) {
+  const laItems = items.filter((it) => it.scale === 'LA');
+  const taItems = items.filter((it) => it.scale === 'TA');
+
+  const cell = (it) => {
+    const c = RT_BAND_COLOURS[it.response_time_band] || RT_BAND_COLOURS.normal;
+    const titleText = `${it.item_id}${it.is_reverse_keyed ? ' (reverse-keyed)' : ''} — ${it.text}\nValue: ${it.value} · Response: ${fmtSec(it.response_time_ms)} · ${c.label}`;
+    return (
+      <button
+        key={it.item_id}
+        type="button"
+        title={titleText}
+        aria-label={`${it.item_id}: ${c.label}, ${fmtSec(it.response_time_ms)}`}
+        className="w-12 h-12 text-[10px] font-mono flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-gold focus-visible:ring-offset-1"
+        style={{ background: c.bg, color: c.fg }}
+      >
+        {it.item_id.replace(/^([LT]A)/, '$1\u00a0').replace(/\s/g, '')}
+      </button>
+    );
+  };
+
+  return (
+    <div className="mt-4">
+      <div className="flex items-center gap-1 flex-wrap">
+        {laItems.map(cell)}
+        {laItems.length > 0 && taItems.length > 0 && (
+          <span aria-hidden="true" className="inline-block w-px h-12 bg-gold mx-2" />
+        )}
+        {taItems.map(cell)}
+      </div>
+      <div className="mt-1 flex items-center gap-1 text-[10px] uppercase tracking-wider2 text-muted">
+        <span style={{ width: laItems.length * 52 }}>Learning Agility</span>
+        <span aria-hidden="true" className="inline-block w-2" />
+        <span style={{ width: taItems.length * 52 }}>Tolerance for Ambiguity</span>
       </div>
     </div>
   );
@@ -535,35 +676,112 @@ function ScoreCard({ title, mean, band, subscales }) {
 }
 
 // -------- AI Discussion Tab -------- //
-function AIDiscussionTab({ doc }) {
+function AIDiscussionTab({ doc, engagement }) {
   const [showJson, setShowJson] = useState(false);
   const convo = doc.conversation || [];
   const af = doc.scores?.ai_fluency || {};
+
+  // Build a lookup from conversation array index → engagement turn (if avail).
+  // Engagement skips kind=='dev' turns, so we re-map by stripping dev turns
+  // here too.
+  const publicConvo = convo.filter((t) => t.kind !== 'dev');
+  const engTurns = engagement?.turns || [];
+
+  const us = engagement?.user_summary;
+  const as = engagement?.assistant_summary;
+
   return (
     <div id="panel-ai" className="space-y-6">
-      <div className="bg-white border border-hairline p-5">
-        <h2 className="eyebrow text-navy">Conversation ({convo.filter(t => t.role === 'user').length} user turns)</h2>
-        <div className="mt-4 space-y-4">
-          {convo.length === 0 && <p className="text-sm text-muted italic">No conversation on record.</p>}
-          {convo.map((t, i) => (
-            <div key={i} className={'p-4 border ' + (t.role === 'assistant' ? 'border-hairline bg-mist' : 'border-navy/10 bg-white')}>
-              <div className="flex items-center justify-between mb-2 text-[11px] uppercase tracking-wider2">
-                <span className={t.role === 'assistant' ? 'text-gold-dark font-medium' : 'text-navy font-medium'}>
-                  {t.role === 'assistant' ? 'Interviewer' : t.role === 'user' ? 'Participant' : t.role}
-                </span>
-                <span className="text-muted">{t.timestamp ? fmtDate(t.timestamp) : ''}</span>
-              </div>
-              <p className="text-[14px] text-ink/85 leading-relaxed whitespace-pre-wrap">{t.content}</p>
-              {t.role === 'assistant' && (t.provider || t.model || t.latency_ms != null) && (
-                <div className="mt-2 text-[10px] uppercase tracking-wider2 text-muted/70 font-mono">
-                  {t.provider && <span className="mr-3">provider={t.provider}</span>}
-                  {t.model && <span className="mr-3">model={t.model}</span>}
-                  {t.latency_ms != null && <span className="mr-3">latency={t.latency_ms}ms</span>}
-                  {t.fallbacks_tried != null && <span>fallbacks={t.fallbacks_tried}</span>}
-                </div>
-              )}
+      {/* ---- Phase 11B: stat strip + sparklines ---- */}
+      {(us || as) && (
+        <div className="bg-white border border-hairline border-t-[3px] border-t-gold p-5">
+          <h2 className="eyebrow text-navy mb-3">Conversation engagement</h2>
+          <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+            {us && <>
+              <span><strong className="text-navy">{us.total_turns}</strong> user turns</span>
+              <span className="text-muted">avg <strong className="text-ink/80">{us.avg_words_per_turn}</strong> words</span>
+              <span className="text-muted">avg time to respond <strong className="text-ink/80">{fmtSec(us.avg_time_to_respond_ms)}</strong></span>
+            </>}
+            {as && <>
+              <span className="text-muted mx-2 hidden md:inline">·</span>
+              <span><strong className="text-navy">{as.total_turns}</strong> assistant turns</span>
+              <span className="text-muted">avg latency <strong className="text-ink/80">{fmtSec(as.avg_latency_ms)}</strong></span>
+              <span className={as.fallbacks_total > 0 ? 'text-terracotta' : 'text-muted'}>
+                <strong>{as.fallbacks_total}</strong> fallback{as.fallbacks_total === 1 ? '' : 's'}
+              </span>
+            </>}
+          </div>
+
+          {us && engTurns.length > 0 && (
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-6">
+              <Sparkline
+                title="Words per user turn"
+                stroke="#1e3a5f"
+                values={engTurns.filter((t) => t.role === 'user').map((t) => t.content_length_words)}
+                yLabel={(v) => `${v}w`}
+              />
+              <Sparkline
+                title="Time to respond per user turn"
+                stroke="#b88a2a"
+                values={engTurns.filter((t) => t.role === 'user').map((t) => Math.round((t.time_to_respond_ms || 0) / 1000))}
+                yLabel={(v) => `${v}s`}
+              />
             </div>
-          ))}
+          )}
+        </div>
+      )}
+
+      <div className="bg-white border border-hairline p-5">
+        <h2 className="eyebrow text-navy">Conversation ({publicConvo.filter(t => t.role === 'user').length} user turns)</h2>
+        <div className="mt-4 space-y-4">
+          {publicConvo.length === 0 && <p className="text-sm text-muted italic">No conversation on record.</p>}
+          {publicConvo.map((t, i) => {
+            const eng = engTurns[i] || null;
+            const isLongest = us && eng && eng.role === 'user' && eng.turn_index === us.longest_turn_index;
+            const isSlowest = us && eng && eng.role === 'user' && eng.turn_index === us.slowest_response_turn_index;
+            return (
+              <div key={i} className={'p-4 border ' + (t.role === 'assistant' ? 'border-hairline bg-mist' : 'border-navy/10 bg-white')}>
+                <div className="flex items-center justify-between mb-2 text-[11px] uppercase tracking-wider2">
+                  <span className={t.role === 'assistant' ? 'text-gold-dark font-medium' : 'text-navy font-medium'}>
+                    {t.role === 'assistant' ? 'Interviewer' : t.role === 'user' ? 'Participant' : t.role}
+                  </span>
+                  <span className="text-muted">{t.timestamp ? fmtDate(t.timestamp) : ''}</span>
+                </div>
+                <p className="text-[14px] text-ink/85 leading-relaxed whitespace-pre-wrap">{t.content}</p>
+
+                {/* Phase 11B — per-turn metadata strip + pills */}
+                {eng && (
+                  <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] uppercase tracking-wider2 text-muted">
+                    {eng.role === 'user' ? (
+                      <>
+                        <span className="text-ink/60"><strong className="text-ink/80">{eng.content_length_words}</strong> words</span>
+                        {eng.time_to_respond_ms !== null && eng.time_to_respond_ms !== undefined && (
+                          <span className="text-ink/60"><strong className="text-ink/80">{fmtSec(eng.time_to_respond_ms)}</strong> to respond</span>
+                        )}
+                        {isLongest && (
+                          <span className="bg-navy text-white px-2 py-0.5 normal-case tracking-normal text-[10px]">Longest turn</span>
+                        )}
+                        {isSlowest && (
+                          <span className="bg-gold text-navy px-2 py-0.5 normal-case tracking-normal text-[10px]">Slowest response</span>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        {eng.model && <span className="font-mono normal-case tracking-normal">model {eng.model}</span>}
+                        {eng.model_latency_ms !== null && eng.model_latency_ms !== undefined && (
+                          <span className="text-ink/60"><strong className="text-ink/80">{fmtSec(eng.model_latency_ms)}</strong> latency</span>
+                        )}
+                        <span className={eng.fallbacks_tried > 0 ? 'text-terracotta' : 'text-ink/60'}>
+                          fallbacks: <strong>{eng.fallbacks_tried}</strong>
+                        </span>
+                        <span className="text-ink/60"><strong className="text-ink/80">{eng.content_length_words}</strong> words</span>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -581,14 +799,104 @@ function AIDiscussionTab({ doc }) {
   );
 }
 
+// Hand-rolled SVG sparkline. Values is an array of numbers (one per data
+// point); X axis is implicit by index. yLabel renders end-of-line annotation.
+function Sparkline({ title, stroke, values, yLabel }) {
+  const w = 320, h = 56, pad = 6;
+  const safe = (values || []).map((v) => Number(v) || 0);
+  const max = Math.max(1, ...safe);
+  const min = 0;
+  const points = safe.map((v, i) => {
+    const x = pad + (safe.length === 1 ? (w - 2 * pad) / 2 : (i / (safe.length - 1)) * (w - 2 * pad));
+    const y = h - pad - ((v - min) / Math.max(1, (max - min))) * (h - 2 * pad);
+    return [x, y];
+  });
+  const dPath = points.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+  const lastVal = safe[safe.length - 1];
+  const maxVal = max;
+  return (
+    <div>
+      <h3 className="eyebrow text-navy mb-2">{title}</h3>
+      <svg width="100%" viewBox={`0 0 ${w} ${h}`} role="img" aria-label={title} style={{ maxWidth: 360 }}>
+        <title>{title}</title>
+        <desc>{`Time-series across ${safe.length} user turns. Max ${yLabel(maxVal)}, latest ${yLabel(lastVal || 0)}.`}</desc>
+        {/* Baseline */}
+        <line x1={pad} y1={h - pad} x2={w - pad} y2={h - pad} stroke="#e5e7eb" strokeWidth={1} />
+        {/* Path */}
+        <path d={dPath} fill="none" stroke={stroke} strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />
+        {/* Dots */}
+        {points.map(([x, y], i) => (
+          <circle key={i} cx={x} cy={y} r={2.2} fill={stroke}>
+            <title>{`Turn ${i + 1}: ${yLabel(safe[i])}`}</title>
+          </circle>
+        ))}
+      </svg>
+      <p className="text-[10px] uppercase tracking-wider2 text-muted">
+        max {yLabel(maxVal)} · latest {yLabel(lastVal || 0)}
+      </p>
+    </div>
+  );
+}
+
 // -------- Scenario Tab -------- //
-function ScenarioTab({ doc }) {
+const SCN_PHASE_LABEL = {
+  read: 'Read',
+  part1: 'Part 1',
+  curveball: 'Curveball',
+  part2: 'Part 2',
+};
+
+function fmtDurationMin(ms) {
+  if (ms === null || ms === undefined || ms === 0) return '0s';
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const r = sec % 60;
+  return r ? `${m}m ${r}s` : `${m}m`;
+}
+
+function ScenarioTab({ doc, engagement }) {
   const scn = doc.scenario || {};
   const scores = doc.scores?.scenario || {};
   const p1 = scn.part1_response || {};
   const p2 = scn.part2_response || {};
+  const phases = engagement?.phases || [];
+  const summary = engagement?.summary || null;
+
   return (
     <div id="panel-scenario" className="space-y-6">
+      {/* ---- Phase 11B: stacked-bar engagement visualisation + stat strip ---- */}
+      {summary && phases.length > 0 && (
+        <div className="bg-white border border-hairline border-t-[3px] border-t-gold p-5">
+          <h2 className="eyebrow text-navy mb-3">Time on each phase</h2>
+          <ScenarioPhaseBars phases={phases} />
+          <div className="mt-4 flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+            <span><strong className="text-navy">Total:</strong> {fmtDurationMin(summary.total_actual_ms)}</span>
+            <span className="text-muted">target {fmtDurationMin(summary.total_target_ms)}</span>
+            {summary.most_engaged_phase && (
+              <span>
+                <strong className="text-navy">Most engaged:</strong>{' '}
+                {SCN_PHASE_LABEL[summary.most_engaged_phase] || summary.most_engaged_phase}{' '}
+                <span className="text-muted">
+                  ({fmtDurationMin(phases.find((p) => p.phase === summary.most_engaged_phase)?.actual_ms || 0)},{' '}
+                  {(phases.find((p) => p.phase === summary.most_engaged_phase)?.ratio || 0).toFixed(2)}× target)
+                </span>
+              </span>
+            )}
+            {summary.least_engaged_phase && summary.least_engaged_phase !== summary.most_engaged_phase && (
+              <span>
+                <strong className="text-navy">Least engaged:</strong>{' '}
+                {SCN_PHASE_LABEL[summary.least_engaged_phase] || summary.least_engaged_phase}{' '}
+                <span className="text-muted">
+                  ({fmtDurationMin(phases.find((p) => p.phase === summary.least_engaged_phase)?.actual_ms || 0)},{' '}
+                  {(phases.find((p) => p.phase === summary.least_engaged_phase)?.ratio || 0).toFixed(2)}× target)
+                </span>
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="bg-white border border-hairline p-5">
           <h2 className="eyebrow text-navy">Part 1 responses</h2>
@@ -651,6 +959,68 @@ function ScenarioTab({ doc }) {
         </div>
       )}
     </div>
+  );
+}
+
+// Hand-rolled SVG: 4 horizontal stacked bars, one per phase. Each bar shows
+// actual time (navy fill) inside the target band (light grey track). When
+// actual exceeds target, the overrun extends past a vertical target line and
+// the overrun tip renders in terracotta.
+function ScenarioPhaseBars({ phases }) {
+  // Compute a shared X scale: max of (any actual_ms, any target_ms × 1.05).
+  const maxTarget = Math.max(...phases.map((p) => p.target_ms));
+  const maxActual = Math.max(...phases.map((p) => p.actual_ms));
+  // Cap visual bar at 2× the longest target to keep one outlier from
+  // shrinking everything else. The label always shows the true value.
+  const cap = Math.max(maxTarget * 2, maxActual);
+  const xMax = Math.min(cap, Math.max(maxTarget * 1.1, maxActual));
+
+  const W = 720, BAR_H = 24, ROW_H = 40, LABEL_W = 110, RIGHT_W = 130;
+  const TRACK_X = LABEL_W;
+  const TRACK_W = W - LABEL_W - RIGHT_W;
+  const xFor = (ms) => (xMax > 0 ? (ms / xMax) * TRACK_W : 0);
+  const H = phases.length * ROW_H + 18;
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} role="img"
+         aria-labelledby="phase-bars-title phase-bars-desc"
+         style={{ maxWidth: 760 }}>
+      <title id="phase-bars-title">Scenario phase time vs target</title>
+      <desc id="phase-bars-desc">{`Four horizontal bars showing actual time spent in each scenario phase against its target. ${phases.filter((p) => p.overran).length} phases overran their target.`}</desc>
+
+      {phases.map((p, i) => {
+        const y = i * ROW_H + 10;
+        const targetW = xFor(p.target_ms);
+        const actualW = xFor(Math.min(p.actual_ms, xMax));
+        const overran = p.overran;
+        const cappedNote = p.actual_ms > xMax;
+        return (
+          <g key={p.phase}>
+            {/* Phase label */}
+            <text x={LABEL_W - 8} y={y + BAR_H / 2 + 4} fontSize="11" fill="#1e3a5f" textAnchor="end" fontWeight="500">
+              {SCN_PHASE_LABEL[p.phase] || p.phase}
+            </text>
+            {/* Target track */}
+            <rect x={TRACK_X} y={y} width={targetW} height={BAR_H} fill="#f3f4f6" stroke="#e5e7eb" strokeWidth={1} />
+            {/* Actual fill (navy) */}
+            <rect x={TRACK_X} y={y + 4} width={Math.min(actualW, targetW)} height={BAR_H - 8} fill="#1e3a5f" />
+            {/* Overrun (terracotta) past the target line */}
+            {overran && (
+              <rect x={TRACK_X + targetW} y={y + 4} width={Math.max(0, actualW - targetW)} height={BAR_H - 8} fill="#b94c3a" />
+            )}
+            {/* Target end-line */}
+            <line x1={TRACK_X + targetW} y1={y - 2} x2={TRACK_X + targetW} y2={y + BAR_H + 2} stroke="#1e3a5f" strokeWidth={1} strokeDasharray="2 2" />
+            {/* Right-side label: actual / target / ratio */}
+            <text x={TRACK_X + TRACK_W + 8} y={y + BAR_H / 2 + 4} fontSize="11" fill="#374151">
+              <tspan fontWeight="600" fill="#1e3a5f">{fmtDurationMin(p.actual_ms)}</tspan>
+              <tspan fill="#9ca3af"> / {fmtDurationMin(p.target_ms)}</tspan>
+              <tspan fill={overran ? '#b94c3a' : '#9ca3af'}> · {p.ratio.toFixed(2)}×</tspan>
+              {cappedNote && <tspan fill="#b94c3a"> ↗</tspan>}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
   );
 }
 

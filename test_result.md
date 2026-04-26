@@ -1412,7 +1412,10 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Phase 11B — engagement_service unit tests (10 new) cover all 4 bands, sparkline metrics, overran phases"
+    - "Phase 11B — GET /api/admin/sessions/{id}/engagement endpoint (admin JWT)"
+    - "Regression: existing /api/admin/sessions/{id} contract unchanged"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -2970,3 +2973,423 @@ agent_communication:
         No code changes made during testing. Both new tasks marked
         working=true, needs_retesting=false. test_plan.current_focus
         cleared. Phase 11A backend ready to ship.
+
+
+backend:
+  - task: "Phase 11B — engagement_service.py (3 pure derivation functions)"
+    implemented: true
+    working: true
+    file: "backend/services/engagement_service.py, backend/tests/test_engagement_service.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            New module with three pure functions, all read-only on a session
+            doc, all tolerant of partial data:
+              psychometric_engagement(doc) → {items[], summary{median_ms, p25/p75, fastest_3, slowest_3, deliberated_count, ...}}
+              ai_discussion_engagement(doc) → {turns[], user_summary, assistant_summary}
+              scenario_engagement(doc) → {phases[4], summary{total/most/least}}
+            Banding rule for psychometric: relative to participant's own
+            median; fast=<0.5×, normal=0.5–1.5×, slow=1.5–2.5×, deliberated=>2.5×.
+            Deliberation count uses Tukey's p75+1.5×IQR threshold.
+            For AI Discussion, time-to-respond on user turns is derived as
+            (current user timestamp − previous assistant timestamp), clamped
+            to ≥0. Dev-kind turns are filtered. Latency / fallbacks / model
+            metadata is preserved on assistant entries. user_summary marks
+            longest_turn_index (by word count) and slowest_response_turn_index.
+            For Scenario, target durations come from
+            services.scenario_service.DURATION_{READ,PART1,CURVEBALL,PART2}_MIN
+            (4/5/4/4 = 17 min total). overran=actual>target. most/least
+            engaged ignore phases with actual_ms==0 (skipped/not-yet-entered).
+            10 unit tests added; ALL PASS:
+              test_psychometric_engagement_empty_when_no_answers
+              test_psychometric_engagement_bands_relative_to_median
+              test_psychometric_engagement_meta_carried
+              test_ai_discussion_engagement_empty
+              test_ai_discussion_engagement_5_turns
+              test_ai_discussion_engagement_skips_dev_turns
+              test_scenario_engagement_empty
+              test_scenario_engagement_full_with_overrun
+              test_scenario_engagement_partial_skipped_phases
+              test_build_engagement_bundle_keys
+            Total backend pytest: 134 passed (was 124 before this phase).
+
+  - task: "Phase 11B — GET /api/admin/sessions/{id}/engagement endpoint"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 11B backend sweep complete. Ran /app/backend_test_phase11b.py
+            against http://localhost:8001/api. 70/70 assertions PASS, no
+            failures. Pytest regression also green (134 passed, matching
+            spec exactly).
+
+            ============  ALL GREEN  ============
+            1. AUTH
+              1.0 POST /admin/auth/login (steve@org-logic.io) → 200 ✓
+              1.1 tra_admin_token cookie issued ✓ (replayed via explicit
+                  Cookie header; Secure cookie can't replay over
+                  http://localhost via requests.Session)
+
+            2. HAPPY PATH — Claire (e5691ed5-e28e-4c28-b803-3d33a578fbe6)
+              2.0 GET /admin/sessions/{claire}/engagement → 200 ✓
+              2.1 top-level keys exactly {psychometric, ai_discussion,
+                  scenario} ✓
+
+              PSYCHOMETRIC:
+              2.3 items length (20) == count of psychometric.answers (20) ✓
+              2.4 every item carries {item_id, scale, subscale,
+                  is_reverse_keyed, text, value, response_time_ms,
+                  response_time_band} ✓
+              2.5 every item.scale ∈ {LA, TA} ✓
+              2.6 is_reverse_keyed is bool ✓
+              2.7 response_time_ms is int ✓
+              2.8 bands ⊆ {fast,normal,slow,deliberated} ✓
+              2.9 ALL FOUR bands appear in Claire's items ✓
+              2.10 summary keys ⊇ {median_ms, p25_ms, p75_ms, iqr_ms,
+                  deliberation_threshold_ms, fastest_3, slowest_3,
+                  deliberated_count} ✓
+              2.11 fastest_3 length 3 ✓
+              2.12 slowest_3 length 3 ✓
+              2.13 deliberated_count is int ✓
+              2.14 fastest_3 ordered ascending by RT (ascending) ✓
+              2.15 slowest_3 ordered descending by RT (descending) ✓
+              2.16 fastest_3 RTs match the 3 globally lowest RTs ✓
+              2.17 slowest_3 RTs match the 3 globally highest RTs ✓
+
+              AI DISCUSSION:
+              2.20 turns is non-empty list ✓
+              2.21 turns count == non-dev turn count in raw conversation ✓
+                  (dev-kind turns correctly excluded)
+              2.22 user turns carry {turn_index, role, content_length_chars,
+                  content_length_words, time_to_respond_ms, timestamp} ✓
+              2.23 assistant turns carry {turn_index, role,
+                  content_length_chars, content_length_words,
+                  model_latency_ms, provider, model, fallbacks_tried,
+                  timestamp} ✓
+              2.24 user.time_to_respond_ms is None or non-negative int ✓
+                  (first user turn's TTR is None as spec requires; all
+                  others non-negative)
+              2.25 user_summary keys ⊇ {total_turns, avg_words_per_turn,
+                  max_words, min_words, longest_turn_index,
+                  shortest_turn_index, avg_time_to_respond_ms,
+                  slowest_response_turn_index} ✓
+              2.26 user_summary.total_turns == count of role=user turns ✓
+              2.27 avg_words_per_turn is float ✓
+              2.28 assistant_summary keys ⊇ {total_turns, avg_latency_ms,
+                  max_latency_ms, fallbacks_total} ✓
+              2.29 fallbacks_total ≥ 0 ✓
+              2.30 at least one assistant turn has provider ∈ {anthropic,
+                  openai, emergent} ✓
+              2.31 at least one assistant turn has non-null
+                  model_latency_ms ✓
+
+              SCENARIO:
+              2.40 phases length == 4 ✓
+              2.41 phase ordering exactly == ["read","part1","curveball",
+                  "part2"] ✓
+              2.42 each phase carries {phase, target_minutes, target_ms,
+                  actual_ms, ratio, overran} ✓
+              2.43 target_minutes match scenario_service constants
+                  (read=4, part1=5, curveball=4, part2=4) ✓
+              2.44 overran is bool on each phase ✓
+              2.45 ratio is float on each phase ✓
+              2.46 sum(target_ms) == 1020000 == summary.total_target_ms ✓
+                  (= 17 × 60 × 1000)
+              2.47 Claire's part1 actual_ms is int (extreme overrun) ✓
+              2.48 Claire's part1 ratio is float (handles ~790× without
+                  crashing — real "left tab open" data, gracefully
+                  represented) ✓
+
+            3. INCOMPLETE — Phase Two Tester
+                  (1178ba0a-4c66-4dd0-a62a-2de014ee5acb)
+              3.0 GET /engagement → 200 ✓
+              3.1 psychometric.items == [] ✓
+              3.2 psychometric.summary is None ✓
+              3.3 ai_discussion.user_summary is None ✓
+              3.4 ai_discussion.assistant_summary is None ✓
+              3.5 scenario.phases == [] ✓
+              3.6 scenario.summary is None ✓
+
+            4. ADA OLDER FIXTURE (f9959971-5ee8-4f9f-83e6-f59ea747d9e0)
+              4.0 GET /engagement → 200 ✓
+              4.1 top-level keys {psychometric, ai_discussion, scenario} ✓
+              4.2 ada.psychometric.answers is empty (older fixture) →
+                  psychometric == {"items": [], "summary": null} ✓
+                  (graceful handling of empty sub-stage)
+              4.3 ada.ai_discussion populated with conversation turns ✓
+              4.4 ada.scenario.phases length 4 (time_on_phase_ms is
+                  populated; durations may be 0 because seed stamps are
+                  identical, but the 4 phases array still renders) ✓
+
+            5. ERROR PATHS
+              5.0 GET /admin/sessions/no-such-session-99999/engagement
+                  → 404 ✓
+              5.1 detail == "Session not found." ✓
+              5.2 GET /admin/sessions/{claire}/engagement WITHOUT admin
+                  cookie → 401 ✓
+              5.3 detail == "Not authenticated." ✓
+
+            6. NO SIDE EFFECTS — engagement endpoint must not stamp
+               last_admin_viewed_at:
+              6.0 First /sessions/{claire} returns last_admin_viewed_at
+                  baseline ✓
+              6.1 /engagement call returns 200 ✓
+              6.2 Direct Mongo readback PROVED engagement endpoint did
+                  NOT change last_admin_viewed_at: read it before, called
+                  /engagement once, read it after — values identical ✓
+                  (no Mongo write side effect)
+              6.3 Subsequent /sessions/{claire} call still advances
+                  last_admin_viewed_at (the detail handler still writes,
+                  as designed) ✓
+
+            7. ROUTE MATCHING
+              7.0 GET /admin/sessions/compare?ids=A,B (Phase 11A endpoint)
+                  → 200, NOT shadowed by the new sub-route ✓
+              7.1 GET /engagement after a /compare call still works ✓
+              7.2 GET /sessions/{claire} after /engagement still works ✓
+              7.3 Detail response carries last_admin_viewed_at and the
+                  full admin doc shape ✓
+              7.4 GET /api/openapi.json → 200 ✓
+              7.5 /api/admin/sessions/{session_id}/engagement appears in
+                  paths ✓
+              7.6 OpenAPI summary "Engagement analytics for a session"
+                  matches (actual: "Engagement analytics for a session
+                  (admin)" — substring match per spec) ✓
+
+            8. REGRESSION — pytest backend/tests/ -q
+              8.0 Exit code 0 ✓
+              8.1 134 passed (matches spec exactly: 124 prior + 10 new
+                  test_engagement_service tests) ✓
+              No prior tests have flipped status; full suite green.
+
+            HARNESS NOTES:
+              - Internal base http://localhost:8001/api per the brief.
+              - Admin JWT cookie extracted from Set-Cookie and replayed
+                via explicit Cookie header.
+              - Direct Mongo verification used for the no-side-effects
+                check (compared last_admin_viewed_at before/after a
+                lone /engagement call).
+              - No fresh sessions were created. No code changes were
+                made during testing. Phase 11B backend is solid;
+                main agent can summarise and close.
+        - working: "NA"
+          agent: "main"
+          comment: |
+            New endpoint declared after admin_get_session, calls
+            engagement_service.build_engagement(doc) and returns the
+            {psychometric, ai_discussion, scenario} bundle. No Mongo writes.
+            Curl-verified locally:
+              - Claire (e5691ed5-...) returns 20 items spanning all four
+                bands (fast/normal/slow/deliberated), median_ms=10142, 23
+                conversation turns with full user/assistant summaries (avg
+                74.1 words, 146.3s avg time-to-respond, 0 fallbacks), and
+                4 scenario phases (the part1 actual_ms=237M ms surfaces a
+                real left-tab-open overrun — correctly handled with
+                ratio=790.5× rather than crashing). PASS
+              - Phase Two Tester (1178ba0a-..., no scores): returns
+                {items: [], summary: null} for psy, {turns: [], user_summary: null,
+                assistant_summary: null} for ai, {phases: [], summary: null}
+                for scenario. PASS
+              - Missing session id → 404 "Session not found." PASS
+              - No admin cookie → 401 "Not authenticated." PASS
+            FastAPI route ordering: this is at /sessions/{session_id}/engagement
+            (a deeper path than /sessions/{session_id}), so it doesn't
+            conflict with the existing /sessions/{session_id} or the Phase 11A
+            /sessions/compare endpoints. Verified no regression on the
+            existing detail handler.
+
+frontend:
+  - task: "Phase 11B — Psychometric tab heatmap + summary strip + sortable RT column + fastest/deliberated lists"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/AdminSessionDetail.js, frontend/src/lib/adminApi.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            adminApi.js: new getEngagement(sessionId) helper.
+            AdminSessionDetail.js: parent fetches engagement in parallel with
+            session doc; passes to each tab as a prop. Failure is non-fatal —
+            tabs gracefully degrade.
+            PsychometricTab now renders (above the existing 20-row table):
+              - "Response engagement" gold-top card with summary strip
+                ("Median: 10.1s · 25th–75th: 5.4s–12.8s · 1 item deliberated")
+              - 20-cell heatmap split LA-block / gold divider / TA-block
+                (cells in participant's randomised display order). Each cell
+                is a focusable button with title attribute (item text + value
+                + ms + band) and aria-label, coloured per band:
+                fast (#cfd8e3), normal (#1e3a5f), slow (#d4a84b),
+                deliberated (#b94c3a). Visible focus ring (gold).
+              - Legend showing all 4 band swatches + median note.
+              - Two side-by-side lists "Fastest 3" + "Most deliberated"
+                with item id, text, ms.
+            The 20-row table now includes columns for the item full text +
+            id (with "R" subscript when reverse-keyed), Scale, Subscale,
+            Value, Response time, and a coloured Band chip. Sort dropdown
+            extended to 3 options (display position, slow→fast, fast→slow).
+            Visually verified on Claire's session via Playwright: 20 cells
+            render, all 4 bands exercised, sortable, fastest/deliberated
+            lists populated.
+
+  - task: "Phase 11B — AI Discussion tab stat strip + twin sparklines + per-turn metadata"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/AdminSessionDetail.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            AIDiscussionTab now renders (above the conversation transcript):
+              - "Conversation engagement" gold-top card stat strip
+                (user turns count, avg words, avg time-to-respond,
+                assistant turns count, avg latency, fallbacks count —
+                fallbacks > 0 highlights terracotta).
+              - Two hand-rolled SVG sparklines:
+                  navy line — words per user turn
+                  gold line — time-to-respond per user turn (seconds)
+                Each has <title>, <desc>, baseline, dot markers with per-turn
+                title tooltips, and a "max X · latest Y" caption.
+            Each user turn now shows under the bubble:
+                "<words> words · <time-to-respond>s to respond"
+              + a "Longest turn" navy pill on the longest_turn_index user
+              turn and a "Slowest response" gold pill on the
+              slowest_response_turn_index user turn (verified single
+              instance of each on Claire's 11-turn convo).
+            Each assistant turn now shows under the bubble:
+                "model <m> · <latency>s latency · fallbacks: <n> · <words> words"
+              with fallbacks count flipping to terracotta when > 0.
+            The legacy provider/model/latency_ms small-print row was
+            replaced — the new per-turn strip carries the same data plus
+            words and the fallback colour-coding.
+
+  - task: "Phase 11B — Scenario tab stacked-bar engagement chart + stat strip"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/AdminSessionDetail.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            ScenarioTab now renders (above the existing Part 1/Part 2/CF/ST
+            cards):
+              - "Time on each phase" gold-top card with hand-rolled SVG
+                ScenarioPhaseBars: 4 horizontal bars (Read, Part 1, Curveball,
+                Part 2). Each bar uses the spec'd colours:
+                  • light grey track (target band)
+                  • navy fill (actual time, capped at target end)
+                  • terracotta tip (overrun beyond target line)
+                  • dashed navy vertical at the target boundary
+                Right-side label: actual / target · ratio× (ratio in terracotta
+                on overrun); ↗ arrow when actual capped at 2× target for
+                visual scale.
+              - <title> + <desc> for screen readers describing how many
+                phases overran.
+              - Stat strip: "Total: <actual> · target <target> · Most engaged:
+                <phase> (<actual>, <ratio>× target) · Least engaged: <phase>
+                (<actual>, <ratio>× target)" — most/least suppressed when
+                identical or absent.
+            Verified on Claire's session: Part 1 actual_ms=237M (one tab
+            left open) renders correctly with terracotta overrun fill and
+            "790.50× target" label; Read/Curveball/Part 2 render under-target
+            in plain navy. The chart correctly conveyed the engagement gap.
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 11B is code-complete. The 3 derivation functions have full
+        unit test coverage (10 new tests, all green; 134 total now).
+        Requesting deep_testing_backend_v2 to verify the HTTP endpoint:
+
+          1) GET /api/admin/sessions/{session_id}/engagement (admin JWT):
+             - Happy path on Claire (e5691ed5-e28e-4c28-b803-3d33a578fbe6 —
+               full data, 20 psy answers, 23-turn convo, 4 scenario phases).
+               Verify response structure has all 3 top-level keys
+               {psychometric, ai_discussion, scenario}. Each has the spec'd
+               sub-keys (items[], summary{...}, turns[], user_summary,
+               assistant_summary, phases[4], summary).
+             - Verify each item in psychometric.items has
+               {item_id, scale, subscale, is_reverse_keyed, text, value,
+                response_time_ms, response_time_band ∈ {fast,normal,slow,deliberated}}.
+             - Verify ai_discussion.turns has user/assistant role mix; user
+               turns have time_to_respond_ms; assistant turns have
+               provider/model/model_latency_ms/fallbacks_tried.
+             - Verify scenario.phases has exactly 4 entries
+               [read, part1, curveball, part2] each with target_minutes,
+               target_ms, actual_ms, ratio, overran. Total target = 17 min.
+             - Empty/incomplete session (1178ba0a-4c66-4dd0-a62a-2de014ee5acb,
+               no scores): all sub-payloads return their empty shape with
+               null summaries. PASS expected.
+             - 404 on missing session id "no-such-session-id-99999".
+             - 401 without admin Cookie.
+             - Re-running on Claire after a new admin_session_engagement
+               fetch must NOT update last_admin_viewed_at (the engagement
+               endpoint is read-only — it explicitly does NOT call the
+               update_one done by admin_get_session).
+
+          2) Verify the route is shown in /api/docs (it's an admin_router
+             endpoint with summary "Engagement analytics for a session").
+
+          3) Regression — confirm
+             pytest backend/tests/ -q
+             still shows 134 passed (was 124 before; +10 new
+             test_engagement_service tests). NO existing test should
+             have flipped status.
+        Admin creds: steve@org-logic.io / test1234, JWT cookie tra_admin_token.
+        Don't auto-fix anything; just report green/red per bullet. No
+        frontend testing this round.
+    - agent: "testing"
+      message: |
+        Phase 11B backend sweep complete. 70/70 assertions PASS, plus
+        pytest backend/tests/ -q reports exactly 134 passed (matches
+        spec). All 8 sections of the test plan are green:
+
+        1. AUTH: admin login + cookie replay ✓
+        2. HAPPY PATH (Claire): top-level keys, all psychometric item
+           keys + summary stats incl. fastest_3 ascending and slowest_3
+           descending; AI Discussion turns have correct user vs assistant
+           shapes, dev-kind turns excluded, summaries match counts; all
+           four bands appear in Claire's 20 items; Scenario phases are
+           exactly 4 in order [read, part1, curveball, part2] with
+           target_minutes (4/5/4/4); sum(target_ms)=1020000=
+           summary.total_target_ms; Claire's part1 extreme overrun
+           handled with ratio as float ✓
+        3. INCOMPLETE (Phase Two Tester): all three sub-payloads return
+           empty shapes with null summaries ✓
+        4. ADA OLDER FIXTURE: psychometric.answers empty → returns
+           {items:[], summary:null}; ai_discussion + scenario populated;
+           graceful partial handling ✓
+        5. ERROR PATHS: 404 "Session not found." for unknown id;
+           401 "Not authenticated." without admin cookie ✓
+        6. NO SIDE EFFECTS: direct Mongo readback before/after a lone
+           /engagement call confirmed last_admin_viewed_at unchanged
+           (no Mongo write); /sessions/{id} still advances it as
+           designed ✓
+        7. ROUTE MATCHING: /admin/sessions/compare?ids=A,B still returns
+           200 (not shadowed); engagement+detail both work in either
+           order; OpenAPI lists the path with summary "Engagement
+           analytics for a session (admin)" ✓
+        8. REGRESSION: pytest 134 passed, exit code 0 ✓
+
+        Test harness at /app/backend_test_phase11b.py. No code changes
+        were made. No fresh sessions created. Main agent can summarise
+        and close Phase 11B backend.
+

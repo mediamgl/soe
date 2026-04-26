@@ -78,6 +78,10 @@ export async function compareSessions(idA, idB) {
   });
   return data;
 }
+export async function getEngagement(sessionId) {
+  const { data } = await adminApi.get(`/sessions/${sessionId}/engagement`);
+  return data;
+}
 export async function getSession(sessionId) {
   const { data } = await adminApi.get(`/sessions/${sessionId}`);
   return data;
