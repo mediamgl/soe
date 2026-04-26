@@ -93,6 +93,8 @@ export default function AdminSessions() {
       includeDeleted: searchParams.get('include_deleted') !== 'false',
       categoryFilter: (searchParams.get('overall_category') || '').split(',').filter(Boolean),
       responseFlag: searchParams.get('response_flag') || '',
+      dateFrom: searchParams.get('date_from') || '',
+      dateTo: searchParams.get('date_to') || '',
       dimMin,
       dimMax,
     };
@@ -109,8 +111,19 @@ export default function AdminSessions() {
   const [sort, setSort] = useState(initialState.sort);
   const [categoryFilter, setCategoryFilter] = useState(initialState.categoryFilter);
   const [responseFlag, setResponseFlag] = useState(initialState.responseFlag);
+  const [dateFrom, setDateFrom] = useState(initialState.dateFrom);
+  const [dateTo, setDateTo] = useState(initialState.dateTo);
   const [dimMin, setDimMin] = useState(initialState.dimMin);   // { learning_agility: '3.5', ... }
   const [dimMax, setDimMax] = useState(initialState.dimMax);
+
+  // Date range validation — if both are set, From must be ≤ To. Invalid range
+  // suppresses the API call so the list doesn't show stale results.
+  const dateRangeError = useMemo(() => {
+    if (dateFrom && dateTo && dateFrom > dateTo) {
+      return 'From date must be on or before To date.';
+    }
+    return null;
+  }, [dateFrom, dateTo]);
 
   const [dimPanelOpen, setDimPanelOpen] = useState(
     Object.keys(initialState.dimMin).length + Object.keys(initialState.dimMax).length > 0
@@ -133,6 +146,8 @@ export default function AdminSessions() {
     if (!includeDeleted) next.set('include_deleted', 'false');
     if (categoryFilter.length) next.set('overall_category', categoryFilter.join(','));
     if (responseFlag) next.set('response_flag', responseFlag);
+    if (dateFrom) next.set('date_from', dateFrom);
+    if (dateTo) next.set('date_to', dateTo);
     for (const [dim, v] of Object.entries(dimMin)) {
       if (v !== '' && v !== null && v !== undefined) next.set(`dimension_min[${dim}]`, String(v));
     }
@@ -140,11 +155,17 @@ export default function AdminSessions() {
       if (v !== '' && v !== null && v !== undefined) next.set(`dimension_max[${dim}]`, String(v));
     }
     setSearchParams(next, { replace: true });
-  }, [q, sort, page, statusFilter, archivedFilter, includeDeleted, categoryFilter, responseFlag, dimMin, dimMax, setSearchParams]);
+  }, [q, sort, page, statusFilter, archivedFilter, includeDeleted, categoryFilter, responseFlag, dateFrom, dateTo, dimMin, dimMax, setSearchParams]);
 
   // ---- Active filter chips (visible above the dim panel content).
   const activeChips = useMemo(() => {
     const out = [];
+    if (dateFrom || dateTo) {
+      const label = dateFrom && dateTo ? `Created ${dateFrom} → ${dateTo}`
+                  : dateFrom            ? `Created from ${dateFrom}`
+                                        : `Created up to ${dateTo}`;
+      out.push({ key: 'date-range', label, kind: 'date' });
+    }
     for (const d of DIMENSIONS) {
       if (dimMin[d.id]) out.push({ key: `min-${d.id}`, label: `${d.label} ≥ ${dimMin[d.id]}`, kind: 'min', dim: d.id });
       if (dimMax[d.id]) out.push({ key: `max-${d.id}`, label: `${d.label} ≤ ${dimMax[d.id]}`, kind: 'max', dim: d.id });
@@ -155,13 +176,14 @@ export default function AdminSessions() {
       out.push({ key: `flag-${responseFlag}`, label: `Flag: ${opt ? opt.label : responseFlag}`, kind: 'flag' });
     }
     return out;
-  }, [dimMin, dimMax, categoryFilter, responseFlag]);
+  }, [dimMin, dimMax, categoryFilter, responseFlag, dateFrom, dateTo]);
 
   function clearChip(c) {
     if (c.kind === 'min') setDimMin((p) => { const n = { ...p }; delete n[c.dim]; return n; });
     else if (c.kind === 'max') setDimMax((p) => { const n = { ...p }; delete n[c.dim]; return n; });
     else if (c.kind === 'cat') setCategoryFilter((p) => p.filter((x) => x !== c.dim));
     else if (c.kind === 'flag') setResponseFlag('');
+    else if (c.kind === 'date') { setDateFrom(''); setDateTo(''); }
     setPage(1);
   }
   function clearAllFilters() {
@@ -170,11 +192,18 @@ export default function AdminSessions() {
     setResponseFlag('');
     setStatusFilter([]);
     setArchivedFilter('');
+    setDateFrom(''); setDateTo('');
     setQ('');
     setPage(1);
   }
 
   const load = useCallback(async () => {
+    // Suppress the API call if the date range is invalid — show the inline
+    // error instead of stale data.
+    if (dateRangeError) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -187,6 +216,8 @@ export default function AdminSessions() {
       if (archivedFilter) params.archived = archivedFilter;
       if (categoryFilter.length) params.overall_category = categoryFilter.join(',');
       if (responseFlag) params.response_flag = responseFlag;
+      if (dateFrom) params.date_from = dateFrom;
+      if (dateTo) params.date_to = dateTo;
       // Coerce string inputs to numbers (or skip empty ones).
       const dmin = {}, dmax = {};
       for (const [k, v] of Object.entries(dimMin)) {
@@ -205,7 +236,7 @@ export default function AdminSessions() {
     } finally {
       setLoading(false);
     }
-  }, [page, pageSize, sort, q, statusFilter, archivedFilter, includeDeleted, categoryFilter, responseFlag, dimMin, dimMax]);
+  }, [page, pageSize, sort, q, statusFilter, archivedFilter, includeDeleted, categoryFilter, responseFlag, dateFrom, dateTo, dimMin, dimMax, dateRangeError]);
 
   // Debounce — re-load 300 ms after the last filter mutation
   useEffect(() => {
@@ -345,6 +376,52 @@ export default function AdminSessions() {
             Show soft-deleted
           </label>
         </div>
+
+        {/* ---- Phase 11A.1: Date range filter (created_at) ---- */}
+        <div className="flex flex-wrap items-center gap-4 text-sm pt-2 border-t border-hairline/70">
+          <div className="flex items-center gap-2">
+            <span className="eyebrow text-muted">Created:</span>
+            <label className="flex items-center gap-1 text-xs text-ink/75">
+              <span className="text-muted">From</span>
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(e) => { setDateFrom(e.target.value); setPage(1); }}
+                className="form-input py-1 px-2 text-xs"
+                aria-label="Created from date"
+                aria-invalid={dateRangeError ? 'true' : 'false'}
+                aria-describedby={dateRangeError ? 'date-range-error' : undefined}
+                max={dateTo || undefined}
+              />
+            </label>
+            <label className="flex items-center gap-1 text-xs text-ink/75">
+              <span className="text-muted">To</span>
+              <input
+                type="date"
+                value={dateTo}
+                onChange={(e) => { setDateTo(e.target.value); setPage(1); }}
+                className="form-input py-1 px-2 text-xs"
+                aria-label="Created to date"
+                aria-invalid={dateRangeError ? 'true' : 'false'}
+                aria-describedby={dateRangeError ? 'date-range-error' : undefined}
+                min={dateFrom || undefined}
+              />
+            </label>
+            {(dateFrom || dateTo) && (
+              <button
+                type="button"
+                onClick={() => { setDateFrom(''); setDateTo(''); setPage(1); }}
+                className="text-[10px] uppercase tracking-wider2 text-muted hover:text-terracotta"
+                aria-label="Clear date range"
+              >Clear</button>
+            )}
+          </div>
+        </div>
+        {dateRangeError && (
+          <p id="date-range-error" role="alert" className="text-xs text-terracotta -mt-1">
+            {dateRangeError}
+          </p>
+        )}
 
         {/* ---- Phase 11A: Category + Response flag row ---- */}
         <div className="flex flex-wrap items-center gap-4 text-sm pt-2 border-t border-hairline/70">
