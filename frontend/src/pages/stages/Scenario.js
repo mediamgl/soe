@@ -137,8 +137,11 @@ export default function Scenario() {
     };
   }, [flushNow]);
 
-  // Browser-close / tab-hide path — use fetch with keepalive:true so the
-  // write survives the unload. Same payload shape as scnAutosave().
+  // Browser-close / tab-hide path — Hotfix Phase 9 (G2). Always send the
+  // FULL current trio for the active phase as the autosave body. Prefer
+  // navigator.sendBeacon (purpose-built to survive unload) with a Blob of
+  // application/json; fall back to fetch keepalive:true if Beacon is
+  // unavailable. Body is verified non-empty before firing.
   useEffect(() => {
     function beacon() {
       const sid = sessionIdRef.current;
@@ -146,25 +149,29 @@ export default function Scenario() {
       if (!sid) return;
       if (ph !== 'part1' && ph !== 'part2') return;
       const trio = ph === 'part1' ? part1Ref.current : part2Ref.current;
-      const body = JSON.stringify({
-        session_id: sid,
-        phase: ph,
-        partial: {
-          q1: typeof trio.q1 === 'string' ? trio.q1 : '',
-          q2: typeof trio.q2 === 'string' ? trio.q2 : '',
-          q3: typeof trio.q3 === 'string' ? trio.q3 : '',
-        },
-      });
+      const partial = {
+        q1: typeof trio.q1 === 'string' ? trio.q1 : '',
+        q2: typeof trio.q2 === 'string' ? trio.q2 : '',
+        q3: typeof trio.q3 === 'string' ? trio.q3 : '',
+      };
+      const bodyStr = JSON.stringify({ session_id: sid, phase: ph, partial });
+      if (!bodyStr || bodyStr.length < 20) return; // never fire an empty/garbled body
+      const url = `${API_BASE}/assessment/scenario/autosave`;
       try {
-        // keepalive lets this POST survive page unload.
-        fetch(`${API_BASE}/assessment/scenario/autosave`, {
+        if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+          const blob = new Blob([bodyStr], { type: 'application/json' });
+          const queued = navigator.sendBeacon(url, blob);
+          if (queued) return;
+        }
+        // Fallback — fetch with keepalive:true.
+        fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body,
+          body: bodyStr,
           keepalive: true,
         }).catch(() => {});
       } catch (_) {
-        // ignore
+        // ignore — best-effort
       }
     }
     function onVis() {
@@ -178,33 +185,49 @@ export default function Scenario() {
     };
   }, []);
 
-  const queueAutosave = useCallback((thisPhase, partial) => {
-    if (!sessionId) return;
+  // Hotfix Phase 9 (G2) — full-trio snapshot autosave on a 400 ms debounce.
+  // Previous behaviour ("partial-merge per keystroke") could lose content if
+  // the user typed continuously across fields without 400 ms pauses; we now
+  // always send all three current values for the active phase, so server
+  // state always mirrors what's on screen.
+  const queueAutosave = useCallback((thisPhase) => {
+    if (!sessionIdRef.current) return;
     if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
     autosaveTimerRef.current = setTimeout(async () => {
+      const sid = sessionIdRef.current;
+      const ph = thisPhase || phaseRef.current;
+      if (!sid || (ph !== 'part1' && ph !== 'part2')) return;
+      const trio = ph === 'part1' ? part1Ref.current : part2Ref.current;
+      const snapshot = {
+        q1: typeof trio.q1 === 'string' ? trio.q1 : '',
+        q2: typeof trio.q2 === 'string' ? trio.q2 : '',
+        q3: typeof trio.q3 === 'string' ? trio.q3 : '',
+      };
       setSaving(true);
       try {
-        const r = await scnAutosave(sessionId, thisPhase, partial);
+        const r = await scnAutosave(sid, ph, snapshot);
         setSavedAt(r.saved_at);
       } catch (_) {
         // Swallow — typing should not be blocked.
       } finally {
         setSaving(false);
       }
-    }, 900);
-  }, [sessionId]);
+    }, 400);
+  }, []);
 
   function updatePart1(k, v) {
     setPart1((prev) => {
       const next = { ...prev, [k]: v };
-      queueAutosave('part1', { [k]: v });
+      part1Ref.current = next;       // keep ref live for the snapshot in queueAutosave
+      queueAutosave('part1');
       return next;
     });
   }
   function updatePart2(k, v) {
     setPart2((prev) => {
       const next = { ...prev, [k]: v };
-      queueAutosave('part2', { [k]: v });
+      part2Ref.current = next;
+      queueAutosave('part2');
       return next;
     });
   }
@@ -453,11 +476,30 @@ function AnswerPhase({ kind, content, values, onChange, saving, savedAt }) {
         {saving ? (
           <span className="text-muted">Saving…</span>
         ) : savedAt ? (
-          <span className="text-gold-dark">Saved • {new Date(savedAt).toLocaleTimeString()}</span>
+          <SavedAgo timestamp={savedAt} />
         ) : null}
       </div>
     </div>
   );
+}
+
+// Hotfix Phase 9 (G2) — live relative timestamp so the participant has visible
+// confirmation that their typing is reaching the server. Updates every 2s.
+function SavedAgo({ timestamp }) {
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = setInterval(() => setTick((n) => n + 1), 2000);
+    return () => clearInterval(id);
+  }, []);
+  const sec = Math.max(0, Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000));
+  const label = sec < 5
+    ? 'Saved just now'
+    : sec < 60
+      ? `Saved ${sec}s ago`
+      : sec < 3600
+        ? `Saved ${Math.floor(sec / 60)}m ago`
+        : `Saved at ${new Date(timestamp).toLocaleTimeString()}`;
+  return <span className="text-gold-dark">{label}</span>;
 }
 
 function CurveballPhase({ content }) {

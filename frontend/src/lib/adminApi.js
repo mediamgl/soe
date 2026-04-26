@@ -70,6 +70,10 @@ export async function runLifecycle() {
   const { data } = await adminApi.post('/lifecycle/run', {});
   return data;
 }
+export async function resynthesize(sessionId) {
+  const { data } = await adminApi.post(`/sessions/${sessionId}/resynthesize`, {});
+  return data;
+}
 export function conversationDownloadUrl(sessionId, fmt /* 'markdown' | 'json' */) {
   const base = `${API_BASE}/admin/sessions/${sessionId}/conversation/download`;
   const q = new URLSearchParams({ format: fmt });

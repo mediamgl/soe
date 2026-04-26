@@ -3,10 +3,10 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowLeft, Download, FileText, FileJson, FileCode, Archive, ArchiveRestore,
   Trash2, RotateCcw, Copy, Check, Clock, AlertTriangle, Mail, Building2, UserSquare2, Calendar,
-  FileCheck2,
+  FileCheck2, RefreshCw,
 } from 'lucide-react';
 import {
-  getSession, patchSession, softDeleteSession, restoreSession,
+  getSession, patchSession, softDeleteSession, restoreSession, resynthesize,
   conversationDownloadUrl, deliverableDownloadUrl, apiErrorMessage,
 } from '../../lib/adminApi';
 import ScoreChip from '../../components/admin/ScoreChip';
@@ -96,6 +96,49 @@ export default function AdminSessionDetail() {
     catch (e) { alert(apiErrorMessage(e, 'Restore failed.')); }
   }
 
+  // Hotfix Phase 9 (G6) — admin re-run of synthesis. Discards any current
+  // deliverable, runs the synthesis worker again. Polls every 5 s until the
+  // synthesis sub-block finishes (status moves out of "in_progress").
+  const [resynthBusy, setResynthBusy] = useState(false);
+  const [resynthMsg, setResynthMsg] = useState(null);
+
+  async function onResynthesize() {
+    if (!window.confirm('This will discard the current deliverable and run synthesis again. Continue?')) return;
+    setResynthBusy(true);
+    setResynthMsg('Re-running synthesis…');
+    try {
+      const r = await resynthesize(sessionId);
+      // Poll session state every 5s, up to 5 minutes, until synthesis
+      // completes or fails.
+      const deadline = Date.now() + 5 * 60 * 1000;
+      let final = null;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 5000));
+        const fresh = await getSession(sessionId);
+        const st = fresh?.synthesis?.status;
+        if (st === 'completed' || st === 'failed') { final = fresh; break; }
+      }
+      if (!final) {
+        setResynthMsg('Still running after 5 minutes — check back later.');
+      } else if (final.synthesis?.status === 'completed') {
+        setResynthMsg('Synthesis completed.');
+        await load();
+      } else {
+        setResynthMsg('Synthesis failed: ' + (final.synthesis?.error || 'unknown'));
+        await load();
+      }
+    } catch (e) {
+      const detail = e?.response?.data?.detail;
+      if (detail && detail.reason === 'missing_inputs') {
+        setResynthMsg(`Cannot re-run: ${(detail.missing || []).join(', ')} score(s) missing.`);
+      } else {
+        setResynthMsg(apiErrorMessage(e, 'Re-synthesis failed.'));
+      }
+    } finally {
+      setResynthBusy(false);
+    }
+  }
+
   const participant = doc?.participant || {};
   const isRedacted = !!doc?.redacted;
   const hasDeliverable = !!(doc?.deliverable && !doc.deliverable.scoring_error);
@@ -165,6 +208,15 @@ export default function AdminSessionDetail() {
             <a href={conversationDownloadUrl(sessionId, 'json')} className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/10 text-white text-xs uppercase tracking-wider2 hover:bg-white/20">
               <FileJson className="w-3.5 h-3.5" /> Convo JSON
             </a>
+            <button
+              type="button"
+              onClick={onResynthesize}
+              disabled={resynthBusy}
+              className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/10 text-white text-xs uppercase tracking-wider2 hover:bg-gold hover:text-navy disabled:opacity-50"
+              aria-label="Re-run synthesis on this session"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${resynthBusy ? 'animate-spin' : ''}`} /> {resynthBusy ? 'Re-running…' : 'Re-run synthesis'}
+            </button>
             <button type="button" onClick={onToggleArchive} className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/10 text-white text-xs uppercase tracking-wider2 hover:bg-white/20">
               {doc.archived ? <><ArchiveRestore className="w-3.5 h-3.5" /> Unarchive</> : <><Archive className="w-3.5 h-3.5" /> Archive</>}
             </button>
@@ -198,6 +250,21 @@ export default function AdminSessionDetail() {
             <strong className="text-navy">Scoring error persisted.</strong>
             <p className="text-muted mt-1">{(doc.deliverable._error) || 'The LLM synthesis did not produce a valid deliverable.'}</p>
           </div>
+        </div>
+      )}
+
+      {resynthMsg && (
+        <div className="mb-5 card-gold-top flex items-start gap-3">
+          <RefreshCw className={`w-4 h-4 text-navy mt-0.5 ${resynthBusy ? 'animate-spin' : ''}`} strokeWidth={2} />
+          <div className="text-sm">
+            <strong className="text-navy">Re-run synthesis</strong>
+            <p className="text-muted mt-1">{resynthMsg}</p>
+          </div>
+          {!resynthBusy && (
+            <button type="button" onClick={() => setResynthMsg(null)} className="ml-auto text-xs uppercase tracking-wider2 text-muted hover:text-navy">
+              Dismiss
+            </button>
+          )}
         </div>
       )}
 

@@ -1251,7 +1251,27 @@ async def scenario_autosave(payload: ScnAutosaveIn, request: Request):
 # --------------------------------------------------------------------------- #
 # Routes — Processing / Synthesis / Results (Phase 7)
 # --------------------------------------------------------------------------- #
-SYNTHESIS_STUCK_AFTER_SEC = 120  # restart if in_progress without updates for 2 min
+# Hotfix Phase 9 (G7) — bumped from 120s to 240s. The synthesis happy path
+# is ~135s on Emergent/Claude-Opus-4-6 with two LLM calls; 240s = full budget
+# from synthesis_service.TOTAL_SYNTHESIS_BUDGET_SEC, matching the participant
+# Processing-screen escape-panel threshold (frontend Patch 1).
+SYNTHESIS_STUCK_AFTER_SEC = 240
+
+
+# Hotfix Phase 9 (G5) — module-level strong-reference registry for synthesis
+# background tasks. asyncio.create_task can be GC'd if its return value isn't
+# retained; this keeps a hold on every in-flight worker until it completes,
+# at which point the done_callback removes it. Read by the admin layer for
+# observability (see /api/admin/dashboard/summary if extended later).
+_SYNTHESIS_TASKS: set = set()
+
+
+def _register_synthesis_task(coro):
+    """Spawn `coro` as an asyncio.Task held in the module-level registry."""
+    task = asyncio.create_task(coro)
+    _SYNTHESIS_TASKS.add(task)
+    task.add_done_callback(_SYNTHESIS_TASKS.discard)
+    return task
 
 
 class ProcessingStartIn(BaseModel):
@@ -1265,7 +1285,10 @@ async def _syn_build_tiers() -> List[Tier]:
 
 async def _run_synthesis_task(session_id: str) -> None:
     """Background worker: runs the synthesis LLM call and writes deliverable.
-    Always terminal — sets synthesis.status to 'completed' or 'failed'."""
+    Always terminal — sets synthesis.status to 'completed' or 'failed'.
+    Hotfix Phase 9 (G4): a `finally` clause re-checks status post-run and
+    forces it to 'failed' if neither branch wrote a terminal status (e.g. if
+    the safety-net update_one itself raised)."""
     try:
         doc = await sessions_coll.find_one({"session_id": session_id})
         if not doc:
@@ -1325,6 +1348,35 @@ async def _run_synthesis_task(session_id: str) -> None:
             )
         except Exception:
             pass
+    finally:
+        # Hotfix Phase 9 (G4) — guarantee a terminal state. If neither the
+        # happy nor the except branch wrote one (e.g. their own update_one
+        # raised), force the status to 'failed' here. Wrap in try/except so
+        # this last-resort cleanup can never propagate.
+        try:
+            doc = await sessions_coll.find_one(
+                {"session_id": session_id},
+                {"_id": 0, "synthesis.status": 1},
+            )
+            still_running = (
+                doc is not None and (doc.get("synthesis") or {}).get("status") == "in_progress"
+            )
+            if still_running:
+                logger.error(
+                    "Synthesis worker exited with status still 'in_progress' for "
+                    "session=%s — forcing 'failed'.", session_id,
+                )
+                await sessions_coll.update_one(
+                    {"session_id": session_id},
+                    {"$set": {
+                        "synthesis.status": "failed",
+                        "synthesis.error": "internal_unhandled",
+                        "synthesis.completed_at": _now_iso(),
+                        "updated_at": _now_iso(),
+                    }},
+                )
+        except Exception:  # pragma: no cover
+            logger.exception("Synthesis worker `finally` cleanup itself failed for %s", session_id)
 
 
 def _syn_is_stuck(synthesis: Dict[str, Any]) -> bool:
@@ -1349,6 +1401,7 @@ async def processing_start(payload: ProcessingStartIn):
         raise HTTPException(status_code=404, detail="Session not found.")
     if doc.get("stage") not in ("processing", "results"):
         raise HTTPException(status_code=409, detail={
+            "reason": "stage_mismatch",
             "message": "Synthesis cannot start yet. Complete the scenario first.",
             "current_stage": doc.get("stage"),
         })
@@ -1358,6 +1411,7 @@ async def processing_start(payload: ProcessingStartIn):
     missing = [k for k in ("psychometric", "ai_fluency", "scenario") if not scores.get(k)]
     if missing:
         raise HTTPException(status_code=409, detail={
+            "reason": "missing_inputs",
             "message": "Synthesis cannot run: missing score blocks.",
             "missing": missing,
         })
@@ -1398,8 +1452,8 @@ async def processing_start(payload: ProcessingStartIn):
             "updated_at": now,
         }},
     )
-    # Fire-and-forget coroutine — survives the response
-    asyncio.create_task(_run_synthesis_task(payload.session_id))
+    # Hotfix Phase 9 (G5) — held in module-level set; auto-discarded on done.
+    _register_synthesis_task(_run_synthesis_task(payload.session_id))
     logger.info("Synthesis started session=%s", payload.session_id)
     return JSONResponse(
         status_code=202,
@@ -2053,6 +2107,59 @@ async def admin_lifecycle_run(current=Depends(require_admin)):
     summary = await lifecycle.run_cleanup_cycle(sessions_coll, force=True)
     await dashboard.invalidate_cache()
     return summary
+
+
+@admin_router.post("/sessions/{session_id}/resynthesize",
+                   summary="Hotfix Phase 9 (G6) — admin force re-run of synthesis on a completed session")
+async def admin_resynthesize(session_id: str, current=Depends(require_admin)):
+    """Admin force-restart of synthesis. Discards any existing deliverable
+    (including scoring_error remnants) and runs the synthesis worker again
+    using the same task-registry pattern as /processing/start.
+
+    Pre-conditions: scores.{psychometric, ai_fluency, scenario} must all be
+    populated (cannot synthesise without all three inputs)."""
+    doc = await sessions_coll.find_one({"session_id": session_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    scores = doc.get("scores") or {}
+    missing = [k for k in ("psychometric", "ai_fluency", "scenario") if not scores.get(k)]
+    if missing:
+        raise HTTPException(status_code=409, detail={
+            "reason": "missing_inputs",
+            "message": "Cannot re-synthesise: required score inputs are missing.",
+            "missing": missing,
+        })
+
+    now = _now_iso()
+    admin_email = (current or {}).get("email") if isinstance(current, dict) else None
+    await sessions_coll.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "deliverable": None,
+            "synthesis": {
+                "status": "in_progress",
+                "started_at": now,
+                "completed_at": None,
+                "error": None,
+                "restarted_by": admin_email,
+                "restarted_at": now,
+            },
+            "stage": "processing",
+            "updated_at": now,
+        }},
+    )
+    _register_synthesis_task(_run_synthesis_task(session_id))
+    await dashboard.invalidate_cache()
+    logger.info("Admin re-synthesis triggered session=%s by=%s",
+                session_id, admin_email or "unknown_admin")
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "in_progress",
+            "started_at": now,
+            "poll_url": f"/api/admin/sessions/{session_id}",
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -1,12 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowRight, RefreshCcw } from 'lucide-react';
+import { ArrowRight, RefreshCcw, AlertTriangle, ArrowLeftCircle } from 'lucide-react';
 import { useSession } from '../../store/sessionStore';
 import { processingStart, processingState, apiErrorMessage } from '../../lib/api';
 
 const MIN_DISPLAY_MS = 8000;
 const POLL_MS = 3000;
 const SLOW_HELPER_AFTER_MS = 90000;
+// Hotfix Phase 9 (G1) — escape panel after this much wall-clock time on the
+// Processing screen with no transition. Matches the backend total-synthesis
+// budget (TOTAL_SYNTHESIS_BUDGET_SEC=240) so we never strand a participant
+// after the server has decided synthesis won't complete.
+const ESCAPE_AFTER_MS = 240000;
 
 const STATUS_LINES = [
   'Synthesising psychometric signal…',
@@ -15,22 +20,37 @@ const STATUS_LINES = [
   'Composing your profile…',
 ];
 
+// Stages we know how to bounce a stuck participant back to.
+const STAGE_ROUTES = {
+  identity: '/start',
+  context: '/context',
+  psychometric: '/assessment/psychometric',
+  'ai-discussion': '/assessment/ai-discussion',
+  scenario: '/assessment/scenario',
+  processing: '/assessment/processing',
+  results: '/assessment/results',
+};
+
 export default function Processing() {
   const navigate = useNavigate();
   const sessionId = useSession((s) => s.sessionId);
+  const stage = useSession((s) => s.stage);
   const advanceStage = useSession((s) => s.advanceStage);
 
-  const [status, setStatus] = useState(null); // null | 'in_progress' | 'completed' | 'failed'
+  const [status, setStatus] = useState(null); // null | 'in_progress' | 'completed' | 'failed' | 'escape'
+  const [escapeReason, setEscapeReason] = useState(null); // null | 'stage_mismatch' | 'timeout' | 'error'
   const [error, setError] = useState(null);
   const [startedMountAt] = useState(() => Date.now());
   const [statusIdx, setStatusIdx] = useState(0);
   const [slowHelper, setSlowHelper] = useState(false);
   const [readyToContinue, setReadyToContinue] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [bouncingHome, setBouncingHome] = useState(false);
 
   const pollRef = useRef(null);
   const statusLineRef = useRef(null);
   const slowRef = useRef(null);
+  const escapeRef = useRef(null);
   const mountedRef = useRef(true);
 
   // Rotate the status line every 3s
@@ -41,15 +61,29 @@ export default function Processing() {
     return () => clearInterval(statusLineRef.current);
   }, []);
 
-  // "Taking a little longer" after 90s
+  // 90 s slow-helper line (kept from Phase 7)
   useEffect(() => {
     slowRef.current = setTimeout(() => setSlowHelper(true), SLOW_HELPER_AFTER_MS);
     return () => clearTimeout(slowRef.current);
   }, []);
 
+  // Hotfix Phase 9 (G1) — 240 s escape-panel timer.
+  useEffect(() => {
+    escapeRef.current = setTimeout(() => {
+      if (!mountedRef.current) return;
+      setStatus((cur) => {
+        // If we already left the loading state, leave it alone.
+        if (cur === 'completed' || cur === 'failed' || cur === 'escape') return cur;
+        setEscapeReason('timeout');
+        return 'escape';
+      });
+    }, ESCAPE_AFTER_MS);
+    return () => clearTimeout(escapeRef.current);
+  }, []);
+
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
 
-  // Boot: GET state; if null → POST start. Poll every 3s.
+  // Boot: GET state; if null → POST start. Poll every 3 s.
   useEffect(() => {
     if (!sessionId) return;
     let stop = false;
@@ -59,8 +93,26 @@ export default function Processing() {
         const st = await processingState(sessionId);
         if (stop) return;
         if (!st.status) {
-          await processingStart(sessionId);
-          setStatus('in_progress');
+          try {
+            await processingStart(sessionId);
+            setStatus('in_progress');
+          } catch (startErr) {
+            // Hotfix Phase 9 (G1) — surface the gate failures explicitly so
+            // the participant gets the escape panel immediately rather than
+            // spinning indefinitely on a false-loading screen.
+            const detail = startErr?.response?.data?.detail;
+            const reason = (detail && typeof detail === 'object') ? detail.reason : null;
+            if (reason === 'stage_mismatch' || reason === 'missing_inputs') {
+              setEscapeReason('stage_mismatch');
+              setStatus('escape');
+              return;
+            }
+            // Some other error — start the escape grace window but allow Retry.
+            setEscapeReason('error');
+            setStatus('escape');
+            setError(apiErrorMessage(startErr, 'Could not start synthesis.'));
+            return;
+          }
         } else {
           setStatus(st.status);
         }
@@ -74,13 +126,13 @@ export default function Processing() {
         try {
           const st = await processingState(sessionId);
           if (stop) return;
-          setStatus(st.status);
+          setStatus((cur) => (cur === 'escape' ? cur : st.status));
           if (st.error) setError(st.error);
           if (st.status === 'completed' || st.status === 'failed') {
             clearInterval(pollRef.current);
           }
         } catch (e) {
-          // transient — keep polling, but surface the last message
+          // transient — keep polling, surface the last message
           setError(apiErrorMessage(e, 'Polling failed; retrying…'));
         }
       }, POLL_MS);
@@ -111,29 +163,73 @@ export default function Processing() {
     try {
       await processingStart(sessionId);
       setStatus('in_progress');
+      setEscapeReason(null);
       setSlowHelper(false);
+      // Reset the 240 s escape timer for the retry window.
+      if (escapeRef.current) clearTimeout(escapeRef.current);
+      escapeRef.current = setTimeout(() => {
+        if (mountedRef.current) {
+          setEscapeReason('timeout');
+          setStatus('escape');
+        }
+      }, ESCAPE_AFTER_MS);
     } catch (e) {
-      setError(apiErrorMessage(e, 'Could not restart synthesis.'));
+      const detail = e?.response?.data?.detail;
+      const reason = (detail && typeof detail === 'object') ? detail.reason : null;
+      if (reason === 'stage_mismatch' || reason === 'missing_inputs') {
+        setEscapeReason('stage_mismatch');
+        setStatus('escape');
+      } else {
+        setError(apiErrorMessage(e, 'Could not restart synthesis.'));
+      }
     } finally {
       setRetrying(false);
     }
   }
 
+  async function onBackToAssessment() {
+    setBouncingHome(true);
+    // Resolve the stage we should bounce to. Prefer the in-store stage; if
+    // it's "processing" itself we fall back to "scenario" (synthesis can
+    // only start once the scenario is complete).
+    const target = (() => {
+      const s = (stage || '').toLowerCase();
+      if (s && s !== 'processing' && STAGE_ROUTES[s]) return STAGE_ROUTES[s];
+      return STAGE_ROUTES.scenario;
+    })();
+    navigate(target, { replace: true });
+  }
+
   async function onContinue() {
     try {
-      // Server should already have set stage=results; if not, align local store.
       await advanceStage('results').catch(() => {});
     } finally {
       navigate('/assessment/results');
     }
   }
 
+  const escapeCopy = useMemo(() => {
+    if (escapeReason === 'stage_mismatch') {
+      return {
+        heading: 'It looks like there are still steps left in your assessment',
+        body: 'Your responses are saved. Pick up where you left off and we’ll generate your report when you finish the remaining steps.',
+        showRetry: false,
+      };
+    }
+    return {
+      heading: 'We’re having trouble completing this step',
+      body: 'Your responses are saved. You can come back to your assessment, or try once more.',
+      showRetry: true,
+    };
+  }, [escapeReason]);
+
   return (
     <section className="max-w-2xl mx-auto">
       <div className="flex flex-col items-center text-center">
-        <PentagonAnimation />
-        <div aria-live="polite" className="mt-10 h-6">
-          {status === 'failed' ? (
+        {status !== 'escape' && <PentagonAnimation />}
+
+        <div aria-live="polite" className="mt-10 min-h-[1.5rem]">
+          {status === 'escape' ? null : status === 'failed' ? (
             <p className="text-sm text-red-700 italic font-serif">We couldn’t complete the synthesis.</p>
           ) : readyToContinue ? (
             <p className="text-sm uppercase tracking-wider2 text-gold-dark">Your results are ready.</p>
@@ -143,14 +239,40 @@ export default function Processing() {
             </p>
           )}
         </div>
+
         {slowHelper && status === 'in_progress' && (
           <p className="mt-6 text-xs uppercase tracking-wider2 text-muted">
             This is taking a little longer than usual…
           </p>
         )}
 
-        {error && status !== 'completed' && (
+        {error && status !== 'completed' && status !== 'escape' && (
           <p className="mt-6 text-xs text-red-700 max-w-md">{error}</p>
+        )}
+
+        {/* Phase 9 G1 — escape panel */}
+        {status === 'escape' && (
+          <div className="card card-gold-top mt-2 max-w-xl text-left">
+            <div className="flex items-center gap-3">
+              <AlertTriangle className="w-5 h-5 text-navy" strokeWidth={1.75} aria-hidden="true" />
+              <span className="eyebrow">Action needed</span>
+            </div>
+            <h2 className="mt-3 font-serif text-2xl text-navy">{escapeCopy.heading}</h2>
+            <p className="mt-3 text-[15px] text-ink/85 leading-relaxed">{escapeCopy.body}</p>
+            {error && <p className="mt-3 text-xs text-muted">{error}</p>}
+            <div className="mt-6 flex flex-wrap gap-3">
+              <button type="button" onClick={onBackToAssessment} disabled={bouncingHome} className="btn-primary disabled:opacity-60">
+                <ArrowLeftCircle className="w-4 h-4" strokeWidth={2} />
+                Back to your assessment
+              </button>
+              {escapeCopy.showRetry && (
+                <button type="button" onClick={onRetry} disabled={retrying} className="btn-ghost disabled:opacity-60">
+                  <RefreshCcw className={`w-4 h-4 ${retrying ? 'animate-spin' : ''}`} strokeWidth={2} />
+                  Try again
+                </button>
+              )}
+            </div>
+          </div>
         )}
 
         {status === 'failed' && (
@@ -176,9 +298,7 @@ export default function Processing() {
 }
 
 // Pentagon SVG with 5 axes that fill in gold one-by-one on a ~10s loop.
-// Uses pure CSS animation; no external dependency.
 function PentagonAnimation() {
-  // Pentagon vertices at 0, 72, 144, 216, 288 deg from top
   const cx = 120;
   const cy = 120;
   const r = 100;
@@ -193,7 +313,6 @@ function PentagonAnimation() {
   return (
     <div className="relative">
       <svg width="240" height="240" viewBox="0 0 240 240" role="img" aria-label="Synthesising assessment profile">
-        {/* Faint concentric outlines */}
         {[0.33, 0.66, 1.0].map((s, i) => (
           <polygon
             key={i}
@@ -204,7 +323,6 @@ function PentagonAnimation() {
             strokeWidth="1"
           />
         ))}
-        {/* 5 axes */}
         {verts.map((v, i) => (
           <line
             key={i}
@@ -219,7 +337,6 @@ function PentagonAnimation() {
             }}
           />
         ))}
-        {/* Outer pentagon outline */}
         <polygon
           points={polyPoints}
           fill="none"
@@ -227,7 +344,6 @@ function PentagonAnimation() {
           strokeWidth="1.25"
           strokeOpacity={0.75}
         />
-        {/* Centre dot */}
         <circle cx={cx} cy={cy} r="3" fill="#1e3a5f" />
       </svg>
       <style>{`

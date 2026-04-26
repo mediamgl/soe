@@ -81,6 +81,13 @@ class Tier:
     call: ProviderCall
 
 
+# Hotfix Phase 9 (G3) — hard per-call timeout. The internal httpx timeouts on
+# tiers 1–3 cap at 30s already; the Emergent fallback (tier 4) had no explicit
+# bound. asyncio.wait_for here gives the cascade ONE consistent ceiling for
+# every tier — see synthesis_service.run_synthesis for the outer 240s budget.
+PER_CALL_TIMEOUT_SEC = 90
+
+
 async def chat(
     messages: List[Dict[str, str]],
     tiers: List[Tier],
@@ -98,7 +105,10 @@ async def chat(
         try:
             logger.info("LLM cascade[%s/%s] tier=%s provider=%s model=%s purpose=%s",
                         idx + 1, len(tiers), tier.name, tier.provider, tier.model, purpose)
-            text = await tier.call(messages, system, max_tokens, tier.model)
+            text = await asyncio.wait_for(
+                tier.call(messages, system, max_tokens, tier.model),
+                timeout=PER_CALL_TIMEOUT_SEC,
+            )
             latency_ms = int((time.time() - started) * 1000)
             return {
                 "text": text,
@@ -108,6 +118,13 @@ async def chat(
                 "tier": tier.name,
                 "fallbacks_tried": idx,
             }
+        except asyncio.TimeoutError:
+            failures.append(TierFailure(tier=tier.name, category="timeout",
+                                        message=f"per-call timeout {PER_CALL_TIMEOUT_SEC}s"))
+            logger.warning(
+                "LLM tier timed out after %ss: name=%s provider=%s model=%s",
+                PER_CALL_TIMEOUT_SEC, tier.name, tier.provider, tier.model,
+            )
         except Exception as exc:  # noqa: BLE001
             category, msg = categorise_exception(exc)
             failures.append(TierFailure(tier=tier.name, category=category, message=msg))

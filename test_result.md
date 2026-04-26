@@ -108,6 +108,269 @@ user_problem_statement: |
   a Save & exit affordance and localStorage hydrate. Placeholder stages remain placeholders.
 
 backend:
+  - task: "Phase 9 hotfix — synthesis timeouts, terminal-status guarantee, admin re-synthesize"
+    implemented: true
+    working: false
+    file: "backend/server.py, backend/services/synthesis_service.py, backend/services/llm_router.py"
+    stuck_count: 1
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: false
+          agent: "testing"
+          comment: |
+            Phase 9 backend sweep complete. Ran /app/backend_test_phase9.py
+            against http://localhost:8001/api. 62/63 assertions PASS. ONE
+            FAILURE — small but real audit-trail bug in the new admin
+            re-synthesize endpoint. Details below.
+
+            ============  FAILURE  ============
+            C4.9 — POST /api/admin/sessions/{ada}/resynthesize succeeds
+                  (returns 202 with the right body, kicks off the worker,
+                  clears deliverable, sets stage=processing, sets
+                  synthesis.status=in_progress + synthesis.restarted_at).
+                  HOWEVER, synthesis.restarted_by is persisted as `None`
+                  instead of the admin email "steve@org-logic.io". The
+                  spec explicitly requires restarted_by==<admin_email>.
+
+                  Root cause: server.py:2134 reads the admin email from
+                  the JWT payload as `current.get("email")`, but
+                  create_access_token (auth_utils.py:35-45) stores the
+                  email in the `sub` claim, not `email`. Existing admin
+                  endpoints correctly use `current["sub"]` (e.g.
+                  /admin/auth/me at server.py:1602). The new endpoint at
+                  server.py:2114 mismatches this contract.
+
+                  Same bug also corrupts the audit log line — the call
+                  emits `INFO: Admin re-synthesis triggered
+                  session=… by=unknown_admin` because admin_email
+                  resolves to None and the logger falls back to
+                  "unknown_admin" (server.py:2153-2154). This means
+                  re-synthesis events are NOT attributable to a specific
+                  admin in the operator audit trail. (Verified directly
+                  in /var/log/supervisor/backend.err.log — both runs in
+                  this sweep wrote `by=unknown_admin`.)
+
+                  REMEDIATION: change line 2134 from
+                    admin_email = (current or {}).get("email") if isinstance(current, dict) else None
+                  to
+                    admin_email = (current or {}).get("sub") if isinstance(current, dict) else None
+                  One-line fix. No other callers of the JWT payload need
+                  to change (the rest of the codebase already reads
+                  `sub`).
+
+            (Side-observation: the F2 log-hygiene assertion in my
+            harness *accidentally* passed because the log file contains
+            stale "Admin settings updated by=steve@org-logic.io" lines
+            from previous Phase-3 sweeps that match my substring search.
+            The actual resynth log lines from this sweep all read
+            `by=unknown_admin`, confirmed via grep.)
+
+            ============  PASSED  ============
+            A. /api/openapi.json
+              A0. 200 OK ✓
+              A1. Exactly 36 /api/* paths (35 prior + 1 new) ✓
+              A2. /api/admin/sessions/{session_id}/resynthesize present ✓
+
+            B. POST /api/assessment/processing/start 409 detail.reason:
+              B0. Fresh session created (Grace Hopper, 203.0.113.50) ✓
+              B1. session at stage=identity → 409 ✓
+              B1.1. detail.reason == "stage_mismatch" ✓
+              B1.2. detail.current_stage == "identity" ✓
+              B2. After mutating scores.scenario off a fresh
+                  stage=processing seed → 409 ✓
+              B2.1. detail.reason == "missing_inputs" ✓
+              B2.2. detail.missing == ["scenario"] (list) ✓
+              (Restored doc post-test.)
+
+            C. POST /api/admin/sessions/{id}/resynthesize:
+              C1. No cookie → 401 ✓
+              C2. Unknown UUID → 404 ✓
+              C3. Session 12d0dd11-… (organic seed missing all 3 score
+                  blocks) → 409 with detail.reason="missing_inputs",
+                  detail.missing == ["psychometric","ai_fluency",
+                  "scenario"] ✓
+              C4 (Ada session 2253141a-…):
+                C4.1. 202 status ✓
+                C4.2. body.status == "in_progress" ✓
+                C4.3. body.started_at present (ISO8601) ✓
+                C4.4. body.poll_url == "/api/admin/sessions/{ada}" ✓
+                C4.5. Endpoint returned in <0.01s — no blocking on the
+                      worker spawn ✓
+                C4.6. DB: deliverable cleared to None ✓
+                C4.7. DB: synthesis.status == "in_progress" ✓
+                C4.8. DB: synthesis.started_at present ✓
+                C4.9. DB: synthesis.restarted_by == admin_email — FAIL,
+                      see above ✗
+                C4.10. DB: synthesis.restarted_at present ✓
+                C4.11. DB: stage == "processing" ✓
+                Also verified out-of-band via direct Mongo: synthesis
+                completed cleanly ~137s later (claude-opus-4-6, fallbacks
+                _tried=0); deliverable was rewritten with all 6 sections
+                + 6 dimension_profiles. Self-healing path is intact.
+
+            D. Regression spot-checks Phases 2-8:
+              D1.   POST /api/sessions → 201 with valid resume_code
+                    (5RFC-PK2E matches XXXX-XXXX) ✓
+              D2.   PATCH /sessions/{id}/stage identity→context → 200 ✓
+              D2.1. PATCH /sessions/{id}/stage context→psychometric
+                    → 200 ✓
+              D3.   GET /assessment/psychometric/next → 200 with item ✓
+              D3.1. POST /assessment/psychometric/answer → 200 ✓
+              D4.   GET /assessment/ai-discussion/state(Ada) → 200 ✓
+              D5.   GET /assessment/scenario/state(Ada) → 200 ✓
+              D6.   admin GET /admin/sessions/{Ada} → 200 with full
+                    scores doc visible ✓
+              D7.   PATCH {archived:true} → 200 ✓
+              D7.1. PATCH {archived:false} → 200 ✓
+              D8.   GET /admin/dashboard/summary → 200 ✓
+              D9.   POST /admin/lifecycle/run → 200 ✓
+
+            E. Privacy regression — public GET /api/sessions/{Ada}:
+              E0. 200 ✓
+              E1. admin_notes ABSENT ✓
+              E1. last_admin_viewed_at ABSENT ✓
+              E1. deleted_at ABSENT ✓
+              E1. hard_delete_at ABSENT ✓
+              E1. redacted ABSENT ✓
+              E2. synthesis is dict ✓
+              E2.1. synthesis keys == exactly {status, started_at,
+                    completed_at} ✓
+              E2.2. synthesis.provider, .model, .fallbacks_tried,
+                    .error, .restarted_by, .restarted_at all ABSENT
+                    from public surface ✓
+              The Phase-8 D3 fix at server.py:371-396 still holds
+              cleanly under the new Phase-9 fields (restarted_by /
+              restarted_at). Public surface is locked down.
+
+            F. Log hygiene during the resynth call window:
+              F1. INFO marker "Admin re-synthesis triggered session=
+                  2253141a-…" present ✓
+              F2. Admin email substring present in log blob ✓
+                  CAVEAT: the substring matched stale Phase-3 log lines
+                  ("Admin settings updated by=steve@org-logic.io"). The
+                  actual resynth log lines from THIS sweep read
+                  "by=unknown_admin" — see C4.9 above.
+              F3. Ada participant email "ada.test@example.co.uk" — ZERO
+                  INFO/WARN/ERROR hits ✓
+              F3. Ada participant organisation "Analytical Engine Co"
+                  — ZERO INFO/WARN/ERROR hits ✓
+              F4. No "sk-emergent-" fragments in logs ✓
+              F4. No "sk-ant-" fragments in logs ✓
+              F4. No "sk-proj-" fragments in logs ✓
+              No full LLM prompts logged at INFO. PII surface clean
+              apart from the audit-attribution gap in C4.9.
+
+            HARNESS NOTES (test-side, not server-side):
+              - Internal base http://localhost:8001/api per the brief.
+              - Admin JWT cookie extracted from Set-Cookie and replayed
+                via explicit Cookie header (Secure cookie can't replay
+                over http://localhost via requests.Session).
+              - Three fresh sessions consumed: one for B1
+                stage_mismatch, one fresh phase-7 seed (mutated to
+                strip scores.scenario for B2), one for D1 regression.
+                None require cleanup — they remain in Mongo for any
+                follow-up sweeps.
+              - Ada session was left re-running synthesis at the end
+                of the C4 sweep; it completed in ~137s out-of-band and
+                Ada now has a fresh deliverable.
+
+            STUCK-TASK ASSESSMENT: not stuck. This is the first review
+            cycle for Phase 9; the bug is a one-line typo in the new
+            endpoint and remediation is clear. stuck_count=1 reflects
+            that one unresolved issue exists; recommend bumping back
+            down to 0 once main agent applies the `email` → `sub` fix
+            and the next sweep confirms restarted_by == admin email.
+
+            Main agent: please apply the one-line fix at server.py:2134
+            ((`current.get("email")` → `current.get("sub")`). Everything
+            else in Phase 9 is green and the synthesis worker pipeline
+            is solid.
+        - working: "NA"
+          agent: "main"
+          comment: |
+            Production incident root-caused: a real participant (Claire,
+            resume Y87Y-U7DC) saw the Processing screen stuck because she
+            had not finished the scenario — `/processing/start` returns 409
+            in that case, but the FE was swallowing the error and spinning
+            the loading animation forever. Synthesis itself was healthy.
+
+            Hotfix bundle (5 patches, all applied as a single deploy):
+
+            G1 — Frontend Processing.js escape panel (240s).
+              Already applied to the frontend; backend changes here include
+              the supporting 409 responses that the frontend keys off:
+              POST /api/assessment/processing/start now returns
+              detail.reason ∈ {"stage_mismatch", "missing_inputs"} so the
+              FE can show the right copy.
+
+            G2 — Frontend Scenario.js autosave reliability.
+              Frontend-only change. Server-side /autosave is unchanged.
+
+            G3 — Hard timeouts on every LLM call:
+              - llm_router.PER_CALL_TIMEOUT_SEC = 90s. Every tier (1, 2, 3,
+                AND the Emergent fallback) is now wrapped in
+                asyncio.wait_for. asyncio.TimeoutError is categorised as
+                "timeout" so the cascade can fall through cleanly.
+              - synthesis_service.TOTAL_SYNTHESIS_BUDGET_SEC = 240s.
+                run_synthesis() now wraps its two-call sequence in
+                asyncio.wait_for; on TimeoutError it returns
+                {ok:false, scoring_error:true, error:"timeout: ..."}
+                so the worker writes synthesis.status="failed" cleanly.
+
+            G4 — _run_synthesis_task `finally` guarantee.
+              Re-reads synthesis.status from Mongo; if still "in_progress"
+              (i.e. neither the happy nor the except branch wrote a
+              terminal status — e.g. their own update_one raised) it
+              forces status="failed" with error="internal_unhandled".
+              The finally itself is wrapped in try/except so the cleanup
+              can never propagate.
+
+            G5 — Module-level _SYNTHESIS_TASKS registry.
+              `_register_synthesis_task(coro)` adds the task to a module
+              `set` and registers a done_callback that auto-discards it.
+              Both /processing/start and /admin/sessions/{id}/resynthesize
+              now use this helper. Verified by a unit test that the task is
+              held while running and removed once done.
+
+            G6 — Admin re-synthesize endpoint.
+              POST /api/admin/sessions/{session_id}/resynthesize (admin
+              JWT only). Pre-condition: scores.{psychometric, ai_fluency,
+              scenario} all populated; otherwise 409 with
+              detail.reason="missing_inputs" and detail.missing list.
+              On success: clears deliverable, sets synthesis to {status:
+              "in_progress", started_at, restarted_by:<admin_email>,
+              restarted_at}, sets stage="processing", spawns the worker
+              via _register_synthesis_task. Returns 202 with poll_url.
+
+            G7 — SYNTHESIS_STUCK_AFTER_SEC bumped from 120s to 240s
+              (matches the new total budget; aligns with the FE
+              escape-panel timer).
+
+            Unit tests added (5 new in tests/test_phase9_hotfix.py):
+              - run_synthesis returns scoring_error=true when the LLM call
+                exceeds the outer budget (tested with a 50ms budget +
+                2s sleep)
+              - llm_router.chat times out a single tier and falls through
+                to the next
+              - llm_router.chat raises LLMRouterError when every tier
+                times out (categories all "timeout")
+              - _run_synthesis_task `finally` forces "failed" when the
+                main body and except branch both fail to write
+              - _SYNTHESIS_TASKS holds a task during execution and
+                discards it on completion via done_callback
+
+            Total backend tests now: 114/114 green (109 prior + 5 new).
+            OpenAPI: 36 /api/* paths (35 prior + 1 new resynthesize).
+            /api/health 200 OK, both services running clean.
+
+            Awaiting deep_testing_backend_v2 sweep covering:
+              - The new admin /resynthesize endpoint (success, missing_inputs
+                409, non-admin 401, 404 unknown session)
+              - /processing/start now carries detail.reason on 409 errors
+              - Regression: every Phases 2–8 endpoint still responds
+              - /api/openapi.json count = 36
+
   - task: "Admin dashboard + lifecycle + exports (Phase 8)"
     implemented: true
     working: true
@@ -1150,10 +1413,12 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Phase 8 — Admin dashboard + lifecycle cron + exports + lifecycle endpoints"
-    - "Soft-delete / hard-delete / restore cycle (with time-frozen verification)"
-    - "Conversation exports (Markdown + JSON) + deliverable admin downloads"
-    - "Regression: Phases 2–7 endpoints still respond correctly"
+    - "Phase 9 hotfix — synthesis timeouts (router per-call + total budget)"
+    - "_run_synthesis_task finally-clause guarantees terminal status"
+    - "asyncio.create_task held in _SYNTHESIS_TASKS module set"
+    - "POST /api/admin/sessions/{id}/resynthesize (admin force re-run)"
+    - "/processing/start returns reason='stage_mismatch' / 'missing_inputs' on 409"
+    - "Regression: Phases 2–8 endpoints still respond correctly"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -1161,9 +1426,84 @@ test_plan:
 agent_communication:
     - agent: "main"
       message: |
-        Phase 8 (Admin dashboard + lifecycle cron + exports) is code-complete
-        and live smoke-tested end-to-end. Requesting a thorough
-        deep_testing_backend_v2 sweep of the new admin surface. The exact
+        Phase 9 hotfix bundle is code-complete and unit-test green
+        (114/114). Requesting a deep_testing_backend_v2 sweep covering the
+        new admin endpoint, the 409 response shape changes, and a
+        regression of Phases 2–8.
+
+        Quick orientation:
+
+        Internal base URL: http://localhost:8001/api
+        Admin creds: steve@org-logic.io / test1234
+        OpenAPI: 36 /api/* paths now (one new: POST /api/admin/sessions/{id}/resynthesize)
+
+        Targets:
+
+          1. POST /api/admin/sessions/{session_id}/resynthesize
+             - 401 on unauthenticated request
+             - 404 on unknown session_id
+             - 409 with detail.reason == "missing_inputs" + detail.missing
+               (a list) when scores.psychometric / .ai_fluency / .scenario
+               are not all populated. Use a fresh seeded session and remove
+               one score block to exercise this.
+             - 202 happy path: response carries
+               {status:"in_progress", started_at, poll_url}.
+             - DB side-effects: deliverable cleared, synthesis = {status:
+               "in_progress", started_at, restarted_by:<admin_email>,
+               restarted_at}, stage="processing".
+             - You can short-circuit the actual LLM call cost: trigger
+               /resynthesize on the pre-existing Ada session
+               (2253141a-…) which already has all scores. The worker WILL
+               kick off; if you don't want to wait ~135s for it to land,
+               poll until synthesis.status moves out of "in_progress" OR
+               cancel after a minute and check the registry length.
+               (You don't need to verify it completes — just that the
+               endpoint correctly clears state, spawns the task, and
+               returns 202.)
+
+          2. POST /api/assessment/processing/start now returns 409 with
+             detail.reason ∈ {"stage_mismatch", "missing_inputs"} on the
+             gate failures (was previously a flat detail.message). Verify:
+             - On a fresh session at stage="identity":
+                 detail.reason == "stage_mismatch"
+                 detail.current_stage == "identity"
+             - On a session at stage="processing" but with one score block
+               nulled out:
+                 detail.reason == "missing_inputs"
+                 detail.missing carries the list
+
+          3. Regression of /api/openapi.json — exactly 36 /api/* paths;
+             includes the new /resynthesize.
+
+          4. Regression spot-checks on Phases 2–8:
+             - POST /api/sessions still 201
+             - admin login + GET /api/admin/settings still 200
+             - psychometric /next + /answer still 200
+             - ai-discussion /start + /state still 200
+             - scenario /state + /advance still 200
+             - processing /start (happy session) still 202
+             - dashboard /summary still 200, has the existing shape
+             - lifecycle /run still 200 (idempotent)
+             - public GET /api/sessions/{id} STILL strips admin-only
+               fields (admin_notes, last_admin_viewed_at, deleted_at,
+               hard_delete_at, redacted, synthesis internals beyond
+               status/started_at/completed_at)
+
+          5. Log hygiene: no participant PII or LLM key material at
+             INFO level, even when /resynthesize is invoked.
+
+        Please update the Phase 9 task's status_history with letter-coded
+        findings and mark working=true / needs_retesting=false if green.
+        Do not change any other phase's task entries or the test_plan.
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 8 (Admin dashboard + lifecycle cron + exports) was code-complete
+        and live smoke-tested end-to-end. The deep_testing_backend_v2 sweep
+        passed (49/49) after a single privacy fix on public GET
+        /api/sessions/{id}.
+
         target list is in the "Admin dashboard + lifecycle + exports (Phase 8)"
         task entry at the top of /app/test_result.md.
 
@@ -2006,3 +2346,89 @@ backend:
 
         Phase 8 task updated to working=true, needs_retesting=false,
         stuck_count=0. Test note was cleaned up post-run.
+
+
+    - agent: "testing"
+      message: |
+        Phase 9 hotfix backend sweep: 62/63 assertions PASS. See the
+        "Phase 9 hotfix — synthesis timeouts, terminal-status guarantee,
+        admin re-synthesize" task's status_history for the full
+        letter-coded detail (A, B, C1-C4, D1-D9, E0-E2.2, F1-F4).
+
+        ONE FAILURE — audit-trail typo in the new admin re-synthesize
+        endpoint:
+
+        C4.9 FAIL. POST /api/admin/sessions/{ada}/resynthesize works
+        end-to-end (202 + correct body, deliverable cleared, stage set
+        to processing, synthesis flipped to in_progress + restarted_at
+        stamped, worker task spawned, second-call DB read confirms all
+        side-effects within ~10ms). BUT synthesis.restarted_by is
+        persisted as `None` instead of "steve@org-logic.io".
+
+        Root cause: server.py:2134 reads
+          admin_email = (current or {}).get("email") if isinstance(current, dict) else None
+        but the JWT payload built by create_access_token
+        (auth_utils.py:35-45) stores the admin email in the `sub`
+        claim, not `email`. Existing admin endpoints correctly read
+        `current["sub"]` (e.g. /admin/auth/me at server.py:1602).
+
+        Same bug also corrupts the audit log line — both runs in this
+        sweep wrote
+          INFO: Admin re-synthesis triggered session=2253141a-… by=unknown_admin
+        to /var/log/supervisor/backend.err.log. So re-synthesis events
+        are NOT attributable to a specific admin in operator audit logs.
+
+        REMEDIATION (one-line fix):
+          server.py:2134
+          - admin_email = (current or {}).get("email") if isinstance(current, dict) else None
+          + admin_email = (current or {}).get("sub") if isinstance(current, dict) else None
+
+        Everything else green:
+          - OpenAPI: exactly 36 /api/* paths; new resynthesize path
+            present (A1-A2).
+          - /processing/start 409 carries the new
+            detail.reason ∈ {stage_mismatch, missing_inputs} shape with
+            current_stage / missing[] respectively (B1-B2).
+          - /admin/sessions/{id}/resynthesize 401-gated (C1), 404 on
+            unknown id (C2), 409 + missing_inputs.detail.missing on a
+            session with all 3 score blocks missing (C3).
+          - 202 happy-path on Ada returns {status, started_at,
+            poll_url}; deliverable cleared, stage=processing, synthesis
+            in_progress with restarted_at stamped (C4.1-C4.11 except
+            C4.9 above). Synthesis itself completed cleanly out-of-band
+            in ~137s with claude-opus-4-6 fallbacks_tried=0; Ada now
+            has a fresh deliverable.
+          - Regression: POST /sessions, PATCH /stage, psychometric
+            next/answer, ai-discussion/state, scenario/state, admin
+            GET/PATCH on Ada, admin/dashboard/summary, admin/lifecycle/
+            run all 200 (D1-D9).
+          - Privacy regression on public GET /api/sessions/{Ada}:
+            admin_notes / last_admin_viewed_at / deleted_at /
+            hard_delete_at / redacted all absent; synthesis reduced to
+            exactly {status, started_at, completed_at} with provider /
+            model / fallbacks_tried / error / restarted_by /
+            restarted_at all stripped. The Phase-8 D3 fix holds
+            cleanly under the new Phase-9 fields (E0-E2.2).
+          - Log hygiene: INFO trigger marker present (F1), zero hits of
+            ada.test@example.co.uk / "Analytical Engine Co" at INFO/
+            WARN/ERROR level, zero sk-emergent-/sk-ant-/sk-proj-
+            fragments in logs (F3-F4). No full LLM prompts logged at
+            INFO. (F2 substring match passed against stale Phase-3
+            log lines — the actual Phase-9 audit lines read
+            `by=unknown_admin` per the C4.9 bug.)
+
+        Test harness notes:
+          - Internal base http://localhost:8001/api per the brief.
+          - Admin JWT extracted from Set-Cookie and replayed via
+            explicit Cookie header (Secure cookie can't replay over
+            http://localhost via requests.Session).
+          - Three fresh sessions consumed (B1 / B2 / D1 regression).
+            None require cleanup.
+          - Ada session was left mid-resynth at end of C4; completed
+            cleanly in ~137s out-of-band.
+
+        Main agent: please apply the one-line `email` → `sub` fix at
+        server.py:2134 and bounce the backend. The synthesis worker
+        pipeline (timeouts, registry, finally-clause guarantee, /processing/
+        start 409 reason shape, public-surface privacy filter) is
+        otherwise solid.

@@ -29,6 +29,7 @@ Doc-23 labels and map both Development Required + Limited Readiness to
 terracotta (with the label distinguishing the two).
 """
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import re
@@ -504,11 +505,40 @@ def _merge_synthesis_parts(part_a: Dict[str, Any], part_b: Dict[str, Any]) -> Di
     return merged
 
 
+# Hotfix Phase 9 (G3) — outer synthesis budget. Per-LLM call has a 90s ceiling
+# (see llm_router.PER_CALL_TIMEOUT_SEC). Two calls + parsing + Mongo writes
+# should comfortably fit in 240s on the happy path; anything beyond is
+# treated as a failure so the participant never sees a hung Processing screen.
+TOTAL_SYNTHESIS_BUDGET_SEC = 240
+
+
 async def run_synthesis(
     session: Dict[str, Any],
     tiers: List[Tier],
 ) -> Dict[str, Any]:
     """Two LLM calls via the 3-tier cascade: (A) narrative, (B) structured; merged."""
+    try:
+        return await asyncio.wait_for(
+            _run_synthesis_inner(session, tiers),
+            timeout=TOTAL_SYNTHESIS_BUDGET_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Synthesis exceeded total budget of %ss for session=%s",
+            TOTAL_SYNTHESIS_BUDGET_SEC, session.get("session_id"),
+        )
+        return {
+            "ok": False,
+            "scoring_error": True,
+            "error": f"timeout: synthesis exceeded {TOTAL_SYNTHESIS_BUDGET_SEC}s budget",
+            "raw": None,
+        }
+
+
+async def _run_synthesis_inner(
+    session: Dict[str, Any],
+    tiers: List[Tier],
+) -> Dict[str, Any]:
     bundle = build_synthesis_input(session)
     bundle_json = json.dumps(bundle, ensure_ascii=False)
 
