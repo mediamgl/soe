@@ -78,6 +78,12 @@ export async function compareSessions(idA, idB) {
   });
   return data;
 }
+export async function cohortSessions(ids) {
+  const { data } = await adminApi.get('/sessions/cohort', {
+    params: { ids: (Array.isArray(ids) ? ids : []).join(',') },
+  });
+  return data;
+}
 export async function getEngagement(sessionId) {
   const { data } = await adminApi.get(`/sessions/${sessionId}/engagement`);
   return data;

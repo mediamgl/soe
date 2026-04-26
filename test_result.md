@@ -1412,10 +1412,7 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus:
-    - "Phase 11B — engagement_service unit tests (10 new) cover all 4 bands, sparkline metrics, overran phases"
-    - "Phase 11B — GET /api/admin/sessions/{id}/engagement endpoint (admin JWT)"
-    - "Regression: existing /api/admin/sessions/{id} contract unchanged"
+  current_focus: []
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -3393,3 +3390,376 @@ agent_communication:
         were made. No fresh sessions created. Main agent can summarise
         and close Phase 11B backend.
 
+
+
+backend:
+  - task: "Phase 11C — cohort_service.py (5 pure aggregation functions + 1 bundler)"
+    implemented: true
+    working: true
+    file: "backend/services/cohort_service.py, backend/tests/test_cohort_service.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            New module with pure derivations across N completed sessions:
+              aggregate_dimensions(sessions) → 6 rows with mean/median/p25/p75/min/max/std_dev/band_distribution
+              compute_heatmap(sessions)      → axis_order + rows[] (label = "First L.")
+              find_outliers(sessions, z=1.5) → per-dimension low/high lists by abs z-score
+              derive_cohort_type(stats)      → top_strengths/top_dev_areas (alpha tiebreak) + template sentences
+              summarise_categories_and_flags(sessions) → category_distribution + flag_summary
+              build_cohort(sessions)         → top-level bundle of all of the above
+            Bands: 5-bucket {Exceptional≥4.5, Strong≥4.0, Moderate≥3.0, Limited≥2.0, Low<2.0}.
+            Outlier threshold: |z| ≥ 1.5 with population stdev. Stable-when-no-variance verified.
+            Score-extraction prefers `deliverable.dimension_profiles[].score`, falls back
+            to raw `scores.*` paths.
+            Template sentences are deterministic — alphabetical tiebreak when means tie,
+            so "AI Fluency" lands ahead of "Learning Agility" at equal means.
+            12 unit tests (all passing): stats correctness, band distribution counts,
+            empty/no-data cases, heatmap shape, z-threshold, no-variance stability,
+            top-3 ranks with tiebreak, all-equal alphabetical, no-data sentence,
+            full bundle keys + 25-session stress.
+            Total backend pytest: 146 passed (was 134; +12 cohort tests).
+
+  - task: "Phase 11C — GET /api/admin/sessions/cohort endpoint"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: |
+            Phase 11C backend sweep complete — ALL GREEN. 104/104 assertions
+            PASS in /app/backend_test_phase11c.py against http://localhost:8001/api.
+            Plus a clean pytest sweep (146 passed) for the regression block.
+
+            Coverage executed against the spec, section by section:
+
+            [1] AUTH
+              1.1 POST /admin/auth/login → 200 + tra_admin_token Set-Cookie ✓
+                  (cookie replayed via explicit Cookie header throughout —
+                  Secure cookie won't carry over plain http via requests.Session)
+
+            [2] HAPPY PATH (4 completed sessions: Ada×2 + Claire + Tester)
+              2.0 200 OK ✓
+              2.1 top-level keys exactly = {axis_order, participants,
+                  cohort_summary, dimension_stats, heatmap, outliers,
+                  cohort_type, category_distribution, flag_summary,
+                  generated_at} ✓
+              2.2 axis_order == ["learning_agility", "tolerance_for_ambiguity",
+                  "cognitive_flexibility", "self_awareness_accuracy",
+                  "ai_fluency", "systems_thinking"] ✓
+              2.3 participants length == 4; every entry has all 10 spec keys
+                  (session_id, name, label, organisation, role,
+                   completion_date, overall_category, overall_colour,
+                   response_pattern_flag, dimension_scores) ✓
+              2.3.* every participant.dimension_scores has all 6 dim keys ✓
+              2.4 cohort_summary.n == 4; organisations sorted+unique;
+                  avg_session_duration_seconds is int > 0 ✓
+              2.5 dimension_stats has 6 entries in axis_order; each entry
+                  has the 11 spec keys (dimension_id, label, n, mean,
+                  median, p25, p75, min, max, std_dev, band_distribution) ✓
+              2.5.bands band_distribution keys == {Exceptional, Strong,
+                  Moderate, Limited, Low}; sum(values) == n for all 6 ✓
+              2.6 heatmap.axis_order == axis_order; heatmap.rows length
+                  == 4; each row.scores is a 6-element list ✓
+              2.7 outliers length == 6 in axis_order. Domain assertions:
+                    Tester is in low_outliers on Learning Agility ✓
+                    Claire is in low_outliers on Cognitive Flexibility ✓
+                    Claire is in low_outliers on Systems Thinking ✓
+                    Claire is in high_outliers on AI Fluency ✓
+                  Each outlier entry has session_id/label/name/score and
+                  std_devs_below (low) or std_devs_above (high). All
+                  low_outliers/high_outliers lists across all 6 dims are
+                  sorted by |z| desc ✓
+              2.8 cohort_type.top_strengths length == 3;
+                  cohort_type.top_dev_areas length == 3; strength_summary
+                  string contains both "strongest dimensions" and
+                  "respectively." (template signature); top_strengths
+                  means are non-increasing; top_dev_areas means are
+                  non-decreasing ✓
+              2.9 category_distribution sum == 4; keys exactly = the 4
+                  valid category labels ✓
+              2.10 flag_summary keys == {none, high_acquiescence,
+                   low_variance, extreme_response_bias, total_flagged};
+                   total_flagged == 1 (Tester is the high_acquiescence
+                   one; Ada×2 + Claire are clean) ✓
+              2.11 generated_at is a parseable ISO 8601 timestamp ✓
+
+            [3] VALIDATION
+              3.1 ids="" → 422 ✓
+              3.2 1 id only → 422 with detail containing
+                  "between 2 and 50" ✓
+              3.3 51× same id (dedupe→1) → 422 ✓
+              3.4 3× same id (dedupe→1) → 422 ✓
+                  (3.3 + 3.4 confirm dedupe runs BEFORE the count check)
+              3.5 unknown id mixed with valid → 404 with
+                  detail.missing == ["bogus-id-99999"] ✓
+              3.6 incomplete session 1178ba0a-… mixed with valid → 422
+                  with detail.message containing "Cohort requires every
+                  session to be completed"; detail.incomplete[0].session_id
+                  == "1178ba0a-…"; reasons include
+                  "missing_scores.psychometric",
+                  "missing_scores.ai_fluency", "missing_scores.scenario",
+                  and "missing_or_errored_deliverable" ✓
+              3.7 No admin cookie → 401 with detail "Not authenticated." ✓
+
+            [4] ROUTE ORDERING (regression of Phase 11A + 11B)
+              4.1 GET /admin/sessions/compare?ids=A,B → 200 with the
+                  Phase 11A compare payload (top-level keys participants,
+                  radar_data, dimension_table, executive_summaries,
+                  key_quotes, scenario_quotes, flags, axis_order,
+                  generated_at all present) ✓
+              4.2 GET /admin/sessions/{ada} → 200 with full session doc
+                  (session_id matches) ✓
+              4.3 GET /admin/sessions/{ada}/engagement → 200 with the
+                  Phase 11B engagement bundle ✓
+              4.4 /api/admin/sessions/cohort listed in /api/openapi.json
+                  with summary EXACTLY:
+                  "Cohort aggregation across N completed sessions (admin)" ✓
+
+            [5] SIDE EFFECTS — cohort must not trigger any Mongo write
+              5.0 Baseline GET /admin/sessions/{ada} → 200 with
+                  last_admin_viewed_at present ✓
+              5.1 GET /admin/sessions/cohort?ids=<4 sessions> → 200 ✓
+              5.2 Second GET /admin/sessions/{ada} stamps a strictly
+                  newer last_admin_viewed_at ✓
+              5.3 (DB-level proxy) Read Mongo directly via MONGO_URL +
+                  DB_NAME from /app/backend/.env. Sequence:
+                    pre = sessions.find_one(ada).last_admin_viewed_at
+                    cohort GET (no detail)
+                    after_cohort = sessions.find_one(ada).last_admin_viewed_at
+                    detail GET
+                    after_detail = sessions.find_one(ada).last_admin_viewed_at
+                  Verified: after_cohort == pre  (cohort wrote nothing) ✓
+                            after_detail != after_cohort (detail did write) ✓
+                  Phase 11C cohort is read-only as designed.
+
+            [6] REGRESSION
+              6.1 cd /app/backend && pytest tests/ -q → exit 0 ✓
+              6.2 "146 passed" (was 134 before Phase 11C; +12 new
+                  test_cohort_service tests as advertised) ✓
+                  All 6 deprecation warnings are pre-existing
+                  (FastAPI on_event, passlib crypt, starlette multipart).
+
+            ENVIRONMENT NOTES (test-side, not server-side):
+              - Internal base http://localhost:8001/api per the brief.
+              - Admin JWT cookie extracted from Set-Cookie ("tra_admin_token=…")
+                and replayed via explicit Cookie header on every authed call
+                (Secure cookie can't replay over plain http via
+                requests.Session).
+              - DB-level proxy used motor/pymongo to read Mongo directly to
+                prove the cohort endpoint is non-mutating; otherwise the
+                detail GET itself stamps last_admin_viewed_at and we couldn't
+                disambiguate.
+              - No code changes were made during testing. No fresh sessions
+                were created.
+
+            STUCK-TASK ASSESSMENT: not stuck. Phase 11C is green across
+            all six review areas (auth, happy path, validation, route
+            ordering, side effects, regression). Main agent can summarise
+            and ship Phase 11C backend.
+        - working: "NA"
+          agent: "main"
+          comment: |
+            New admin-only endpoint declared BEFORE /sessions/{session_id}, so
+            FastAPI doesn't capture "cohort" as a session_id (same trick as
+            Phase 11A's /compare). Validates:
+              - 2 ≤ N ≤ 50 unique session ids in the comma-separated `ids` param
+              - All sessions exist (404 with detail.missing[] otherwise)
+              - All sessions completed (status==completed OR stage==results) AND have
+                psychometric+ai_fluency+scenario score blocks AND a deliverable
+                (422 with detail.incomplete[].reasons[] otherwise)
+            Returns: axis_order, participants[], cohort_summary, dimension_stats[6],
+            heatmap, outliers[6], cohort_type, category_distribution, flag_summary,
+            generated_at.
+            Curl-verified locally with all 4 completed sessions (Ada×2 + Claire + Tester):
+              - Full payload returned with 9 top-level keys.
+              - dimension_stats correctly compute means: LA 3.90, TA 3.60, CF 3.50,
+                SA 3.90, AI 3.65, ST 3.50.
+              - 4-session outliers correctly flagged: Tester low on LA (3.5 vs 3.9 mean),
+                Claire low on CF (1.0 vs 3.5) and ST (1.0 vs 3.5), Claire high on AI
+                (3.8 vs 3.65 mean). All within real data, no false positives.
+              - cohort_type strengths: LA 3.90, SA 3.90, AI 3.65 (alpha tiebreak chose
+                AI ahead of LA at equal means). dev_areas: CF 3.50, ST 3.50, TA 3.60.
+              - strength_summary: "This cohort's strongest dimensions are Learning
+                Agility, Self-Awareness Accuracy and AI Fluency, with cohort means
+                of 3.9, 3.9 and 3.6 respectively." (correct template).
+              - category_distribution: all 4 are High Potential.
+              - flag_summary: 1 high_acquiescence (Tester), 3 clean.
+              - 422 on N<2 (1 id only)
+              - 404 on unknown id with detail.missing array
+              - 422 on incomplete session with detail.incomplete[].reasons[]
+              - 401 without admin JWT cookie
+            Read-only — no Mongo writes. No LLM calls.
+            Available in /api/openapi.json with summary "Cohort aggregation across
+            N completed sessions (admin)".
+
+frontend:
+  - task: "Phase 11C — AdminSessions Cohort button + 3+-select toolbar"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/AdminSessions.js, frontend/src/lib/adminApi.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            adminApi.js: new cohortSessions(ids) helper (params.ids = csv).
+            AdminSessions.js: bulk-select toolbar now shows BOTH Compare + Cohort
+            buttons. State machine:
+              0 selected → no toolbar
+              1 selected → both disabled + helper text "pick more for cohort or comparison"
+              2 selected → both enabled (Compare via gold, Cohort via white-on-navy)
+              3+ selected → Compare disabled (only handles 2), Cohort enabled
+            Title attributes explain the disable reason. Clicking Cohort routes to
+            /admin/cohort?ids=<csv>. Verified Playwright: 1/2/3 selection states all
+            correct; clicking Cohort with 3 selected navigates to a 3-participant
+            cohort page successfully.
+
+  - task: "Phase 11C — AdminCohort 9-section view"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/admin/AdminCohort.js, frontend/src/App.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: |
+            New /admin/cohort?ids=... route. Renders 9 sections in order:
+              1. Header strip — "Cohort View — N participants" + participant labels +
+                 Print button + Back link.
+              2. Cohort summary card — N, completion range, avg session, organisations.
+              3. Dimension distribution — hand-rolled SVG with 6 horizontal "violin-lite"
+                 rows per dimension: navy whisker (min..max), navy IQR box (p25..p75),
+                 gold median tick, navy mean dot, score scale 1..5 along bottom, σ on
+                 the right. <title> + <desc> for screen readers.
+              4. Heatmap — N rows × 6 columns, cells coloured by 5-bucket band
+                 (Exceptional=#0f1f33 deep navy, Strong=#1e3a5f navy, Moderate=#d4a84b gold,
+                 Limited=#e8a08e light terracotta, Low=#b94c3a deep terracotta). Each cell
+                 keyboard-focusable (tabIndex=0) with role="img" + aria-label + title.
+                 Row labels are external-link to /admin/sessions/{id} (target=_blank).
+              5. Cohort type — twin cards: navy-top "Cohort strengths" + gold-top
+                 "Development priorities", each with top-3 ranked list and the
+                 derived template sentence.
+              6. Outlier panel — per-dimension low/high lists with std-dev annotation;
+                 each entry is a dotted-underline link to the participant's detail.
+                 "No outliers in this cohort." fallback when none.
+              7. Category distribution donut — 4-segment SVG donut (navy / gold-dark /
+                 light terracotta / deep terracotta) with N at the centre and a legend
+                 with absolute count + percentage.
+              8. Flag summary — "X flagged · Y high-acquiescence · Z low-variance" pills
+                 in mist/terracotta border; "No response-pattern flags in this cohort."
+                 fallback when 0 flagged.
+              9. Footer — "Cohort generated <date>" + Back to sessions.
+            Print stylesheet: @page A4 landscape, page-break-inside:avoid on each
+            cohort-section, hides cohort-no-print chrome.
+            Visually verified Playwright on a real 4-participant cohort:
+              - All 9 sections render
+              - 24 heatmap cells rendered (4 × 6) with all 5 bands exercised
+              - 2 SVG charts (dimension distribution + donut) present
+              - Cohort type narrative ends with "respectively." sentence
+              - Heatmap row links open participant detail in new tab
+
+agent_communication:
+    - agent: "main"
+      message: |
+
+    - agent: "testing"
+      message: |
+        Phase 11C backend sweep complete — ALL GREEN.
+        104/104 assertions in /app/backend_test_phase11c.py PASS against
+        http://localhost:8001/api, plus pytest backend/tests/ -q reports
+        146 passed (+12 cohort_service tests as advertised).
+
+        Coverage in line with the spec, no failures:
+          [1] AUTH login + Set-Cookie extraction
+          [2] HAPPY PATH 4 sessions: top-level keys, axis_order, all
+              participant keys, cohort_summary, dimension_stats (band sums
+              == n), heatmap shape, outliers (Tester low LA; Claire low CF
+              & ST; Claire high AI; sorted by |z| desc; spec key shape),
+              cohort_type top_strengths/dev_areas length 3 + monotonic
+              means + template signature, category_distribution sums to 4,
+              flag_summary.total_flagged == 1, generated_at parseable
+          [3] VALIDATION empty/1-id/dedupe-3×/dedupe-51× → 422 with
+              "between 2 and 50"; unknown id → 404 with detail.missing;
+              incomplete (1178ba0a-…) → 422 with detail.incomplete[0]
+              reasons including all 4 spec values; no cookie → 401
+          [4] ROUTE ORDERING /sessions/compare, /sessions/{id},
+              /sessions/{id}/engagement all still 200; openapi has
+              /api/admin/sessions/cohort with the exact spec summary
+          [5] SIDE EFFECTS DB-level proxy via MONGO_URL confirms cohort
+              does NOT touch last_admin_viewed_at; detail call does
+          [6] REGRESSION pytest 146 passed, exit 0
+
+        No code changes were made during testing.
+
+        Phase 11C is code-complete. Requesting deep_testing_backend_v2 for
+        thorough HTTP coverage of GET /api/admin/sessions/cohort:
+
+          1) Happy path with 4 completed sessions (Ada×2 + Claire + Tester):
+             - GET /api/admin/sessions/cohort?ids=f9959971-5ee8-4f9f-83e6-f59ea747d9e0,2253141a-830f-4810-a683-890f098b5664,e5691ed5-e28e-4c28-b803-3d33a578fbe6,5953a3d3-9539-45dd-9835-34a8c719be19
+             - Verify top-level keys exactly = {axis_order, participants, cohort_summary,
+               dimension_stats, heatmap, outliers, cohort_type, category_distribution,
+               flag_summary, generated_at}.
+             - axis_order is the 6-element list in fixed order.
+             - participants count == 4; each has session_id, name, label, organisation,
+               role, completion_date, overall_category, overall_colour,
+               response_pattern_flag, dimension_scores (6 keys, normalised float).
+             - cohort_summary.n == 4. organisations is a sorted unique list.
+               avg_session_duration_seconds is an int > 0.
+             - dimension_stats has exactly 6 entries in axis_order with each entry
+               carrying dimension_id, label, n, mean, median, p25, p75, min, max,
+               std_dev, band_distribution (dict of 5 band names → counts that sum to n).
+             - heatmap.axis_order == axis_order; heatmap.rows length == 4; each row
+               has session_id, label, name, scores (6-element list of floats or null).
+             - outliers has exactly 6 entries; each with low_outliers/high_outliers
+               sorted by |std_devs| desc, each entry having session_id, label, name,
+               score, std_devs_*. With this 4-session cohort: Tester low on LA;
+               Claire low on CF and ST; Claire high on AI. No false positives in
+               other dims.
+             - cohort_type.top_strengths length 3; cohort_type.top_dev_areas length 3.
+               strength_summary string contains the labels and means.
+             - category_distribution sums to 4; flag_summary.total_flagged == 1.
+
+          2) Validation gates:
+             - 1 id only → 422 "must contain between 2 and 50"
+             - Empty ids → 422
+             - 51 ids (just send the same id duplicated 51× — backend dedupes BUT
+               I want you to confirm the dedupe works AND the count check uses
+               unique count, not raw count)
+             - Unknown id mixed with valid → 404 with detail.missing[]
+             - Incomplete session id (1178ba0a-4c66-4dd0-a62a-2de014ee5acb) mixed
+               with valid → 422 with detail.incomplete[].reasons[]
+             - No admin Cookie → 401
+
+          3) Route ordering:
+             - GET /api/admin/sessions/cohort? returns the cohort endpoint
+             - GET /api/admin/sessions/compare?ids=A,B still returns the Phase 11A
+               compare endpoint (not regressed)
+             - GET /api/admin/sessions/<a real session id> still returns the detail
+               endpoint
+             - GET /api/admin/sessions/<a real session id>/engagement still returns
+               the Phase 11B engagement endpoint
+             - Confirm /api/admin/sessions/cohort appears in /api/openapi.json with
+               summary "Cohort aggregation across N completed sessions (admin)"
+
+          4) Side effects:
+             - Calling /sessions/cohort must NOT update last_admin_viewed_at on any
+               of the participating sessions (verify by capturing baseline,
+               calling cohort, re-fetching detail, baseline unchanged).
+
+          5) Regression: pytest backend/tests/ -q must show 146 passed
+             (was 134; +12 new test_cohort_service tests).
+
+        Admin creds: steve@org-logic.io / test1234. Backend on localhost:8001/api.
+        Don't auto-fix anything. No frontend testing this round.

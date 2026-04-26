@@ -56,6 +56,7 @@ from services import lifecycle_service as lifecycle
 from services import conversation_export
 from services import dashboard_summary as dashboard
 from services import engagement_service
+from services import cohort_service
 import psychometric_service
 
 ROOT_DIR = Path(__file__).parent
@@ -2373,6 +2374,84 @@ async def admin_compare_sessions(
         "axis_order": COMPARE_AXIS_ORDER,
         "generated_at": _now_iso(),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Phase 11C — admin cohort view (N >= 2 sessions, capped at 50).
+# Read-only data assembly via cohort_service. NO LLM calls. NO Mongo writes.
+# --------------------------------------------------------------------------- #
+COHORT_MIN_N = 2
+COHORT_MAX_N = 50
+
+
+@admin_router.get(
+    "/sessions/cohort",
+    summary="Cohort aggregation across N completed sessions (admin)",
+)
+async def admin_cohort_sessions(
+    ids: str,
+    current=Depends(require_admin),
+):
+    # --- Parse and de-duplicate ids preserving input order.
+    raw_ids = [i.strip() for i in (ids or "").split(",") if i.strip()]
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for sid in raw_ids:
+        if sid not in seen:
+            seen.add(sid)
+            ordered.append(sid)
+    if not (COHORT_MIN_N <= len(ordered) <= COHORT_MAX_N):
+        raise HTTPException(
+            status_code=422,
+            detail=(f"`ids` must contain between {COHORT_MIN_N} and {COHORT_MAX_N} "
+                    f"unique session ids; received {len(ordered)}."),
+        )
+
+    # --- Fetch all sessions in one query.
+    docs: Dict[str, Optional[Dict[str, Any]]] = {sid: None for sid in ordered}
+    cursor = sessions_coll.find({"session_id": {"$in": ordered}}, {"_id": 0})
+    async for d in cursor:
+        if d.get("session_id") in docs:
+            docs[d["session_id"]] = d
+    missing = [sid for sid, d in docs.items() if d is None]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": "One or more sessions not found.", "missing": missing},
+        )
+    ordered_docs: List[Dict[str, Any]] = [docs[sid] for sid in ordered]  # type: ignore[list-item]
+
+    # --- Validate every session is completed with all 3 score blocks AND a deliverable.
+    incomplete: List[Dict[str, Any]] = []
+    for d in ordered_docs:
+        scores = d.get("scores") or {}
+        deliv = d.get("deliverable") or {}
+        reasons: List[str] = []
+        if d.get("status") != "completed" and d.get("stage") != "results":
+            reasons.append("not_completed")
+        for k in ("psychometric", "ai_fluency", "scenario"):
+            if not scores.get(k):
+                reasons.append(f"missing_scores.{k}")
+        if not deliv or deliv.get("scoring_error"):
+            reasons.append("missing_or_errored_deliverable")
+        if reasons:
+            incomplete.append({
+                "session_id": d.get("session_id"),
+                "reasons":    reasons,
+            })
+    if incomplete:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message":    "Cohort requires every session to be completed with full scores and a deliverable.",
+                "incomplete": incomplete,
+            },
+        )
+
+    # --- Build cohort payload.
+    payload = cohort_service.build_cohort(ordered_docs)
+    payload["generated_at"] = _now_iso()
+    return payload
 
 
 @admin_router.get("/sessions/{session_id}", summary="Get a full session (admin)")

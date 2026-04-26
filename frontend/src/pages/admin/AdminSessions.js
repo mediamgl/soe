@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Search, ChevronLeft, ChevronRight, Lock, Archive, ArchiveRestore, Trash2,
-  RotateCcw, MoreHorizontal, Sliders, X as IconX, GitCompare, Info,
+  RotateCcw, MoreHorizontal, Sliders, X as IconX, GitCompare, Users, Info,
 } from 'lucide-react';
 import {
   listSessions, patchSession, softDeleteSession, restoreSession, apiErrorMessage,
@@ -271,6 +271,11 @@ export default function AdminSessions() {
     if (selectedIds.size !== 2) return;
     const ids = Array.from(selectedIds);
     navigate(`/admin/compare?ids=${encodeURIComponent(ids.join(','))}`);
+  };
+  const onCohort = () => {
+    if (selectedIds.size < 2) return;
+    const ids = Array.from(selectedIds);
+    navigate(`/admin/cohort?ids=${encodeURIComponent(ids.join(','))}`);
   };
 
   async function onArchiveToggle(row) {
@@ -544,13 +549,13 @@ export default function AdminSessions() {
         </div>
       </div>
 
-      {/* Compare toolbar (Phase 11A) */}
+      {/* Compare + Cohort toolbar (Phase 11A + 11C) */}
       {selectedIds.size > 0 && (
-        <div className="flex items-center justify-between bg-navy text-white px-4 py-2.5 mb-3 text-sm">
+        <div className="flex items-center justify-between bg-navy text-white px-4 py-2.5 mb-3 text-sm flex-wrap gap-y-2">
           <span>
             <strong>{selectedIds.size}</strong> selected
-            {selectedIds.size === 1 && <span className="text-white/70 ml-2">· pick 1 more to compare</span>}
-            {selectedIds.size > 2 && <span className="text-white/70 ml-2">· pick exactly 2 to compare</span>}
+            {selectedIds.size === 1 && <span className="text-white/70 ml-2">· pick more for cohort or comparison</span>}
+            {selectedIds.size > 2 && <span className="text-white/70 ml-2">· cohort view supports any N ≥ 2; compare needs exactly 2</span>}
           </span>
           <div className="flex items-center gap-3">
             <button
@@ -562,6 +567,7 @@ export default function AdminSessions() {
               type="button"
               onClick={onCompare}
               disabled={selectedIds.size !== 2}
+              title={selectedIds.size !== 2 ? 'Compare requires exactly 2 sessions' : 'Side-by-side compare'}
               className={
                 'inline-flex items-center gap-2 px-3 py-1.5 text-xs uppercase tracking-wider2 border ' +
                 (selectedIds.size === 2
@@ -570,6 +576,20 @@ export default function AdminSessions() {
               }
             >
               <GitCompare className="w-3.5 h-3.5" /> Compare
+            </button>
+            <button
+              type="button"
+              onClick={onCohort}
+              disabled={selectedIds.size < 2}
+              title={selectedIds.size < 2 ? 'Cohort view requires at least 2 sessions' : 'Aggregate cohort view'}
+              className={
+                'inline-flex items-center gap-2 px-3 py-1.5 text-xs uppercase tracking-wider2 border ' +
+                (selectedIds.size >= 2
+                  ? 'bg-white text-navy border-white hover:bg-gold hover:border-gold'
+                  : 'border-white/30 text-white/40 cursor-not-allowed')
+              }
+            >
+              <Users className="w-3.5 h-3.5" /> Cohort
             </button>
           </div>
         </div>
