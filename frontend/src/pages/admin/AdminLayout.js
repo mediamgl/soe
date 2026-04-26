@@ -38,7 +38,7 @@ export default function AdminLayout() {
   return (
     <div className="min-h-screen bg-paper">
       <header className="border-b border-hairline bg-navy text-white">
-        <div className="max-w-content mx-auto px-6 sm:px-8 h-14 flex items-center justify-between">
+        <div className="max-w-screen-2xl mx-auto px-6 sm:px-8 h-14 flex items-center justify-between">
           <Link to="/admin" className="flex items-center gap-3">
             <span className="h-5 w-[2px] bg-gold" aria-hidden="true" />
             <span className="font-serif text-lg tracking-wide">Admin Console</span>
@@ -56,7 +56,7 @@ export default function AdminLayout() {
         </div>
       </header>
 
-      <div className="max-w-content mx-auto px-6 sm:px-8 pt-8 pb-20 flex gap-10">
+      <div className="max-w-screen-2xl mx-auto px-6 sm:px-8 pt-8 pb-20 flex gap-10">
         <aside className="w-52 shrink-0 hidden md:block">
           <nav>
             <ul className="space-y-1">
@@ -91,7 +91,7 @@ export default function AdminLayout() {
       </div>
 
       <footer className="border-t border-hairline">
-        <div className="max-w-content mx-auto px-6 sm:px-8 py-5 text-xs uppercase tracking-wider2 text-muted">
+        <div className="max-w-screen-2xl mx-auto px-6 sm:px-8 py-5 text-xs uppercase tracking-wider2 text-muted">
           Demonstration Version · Methodology by Steven Bianchi
         </div>
       </footer>

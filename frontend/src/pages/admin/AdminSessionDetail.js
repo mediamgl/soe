@@ -383,6 +383,8 @@ function RadarChart({ profiles }) {
   const order = ['learning_agility', 'tolerance_for_ambiguity', 'cognitive_flexibility',
                  'self_awareness_accuracy', 'ai_fluency', 'systems_thinking'];
   const scores = Object.fromEntries((profiles || []).map((p) => [p.dimension_id, p.score]));
+  // Label radius slightly further out to allow room for text without the polygon clipping it.
+  const LABEL_R = r + 18;
   const axes = order.map((id, i) => {
     const angle = (-Math.PI / 2) + (i / order.length) * Math.PI * 2;
     const x = cx + r * Math.cos(angle);
@@ -390,15 +392,30 @@ function RadarChart({ profiles }) {
     const score = scores[id] ?? 0;
     const sx = cx + (score / 5) * r * Math.cos(angle);
     const sy = cy + (score / 5) * r * Math.sin(angle);
-    const labelX = cx + (r + 14) * Math.cos(angle);
-    const labelY = cy + (r + 14) * Math.sin(angle);
-    return { id, x, y, sx, sy, labelX, labelY, score, angle };
+    const labelX = cx + LABEL_R * Math.cos(angle);
+    const labelY = cy + LABEL_R * Math.sin(angle);
+    // Split each label into up to two lines on whitespace — keeps long
+    // names like "TOLERANCE FOR AMBIGUITY" inside the SVG canvas without
+    // truncation while still aligning to the perimeter.
+    const words = id.replace(/_/g, ' ').split(' ');
+    const lines = words.length <= 1
+      ? [words[0]]
+      : words.length === 2
+        ? [words[0], words[1]]
+        : [words.slice(0, words.length - 1).join(' '), words[words.length - 1]];
+    return { id, x, y, sx, sy, labelX, labelY, score, angle, lines };
   });
   const polyPoints = axes.map((a) => `${a.sx},${a.sy}`).join(' ');
 
+  // SVG canvas widened on all sides so two-line labels fit at any axis.
+  // Old: -30 0 280 250  → labels clipped at 'TOLERANCE FO' etc.
+  // New: -90 -30 400 280 → ~80px each side + 30px top/bottom of breathing
+  // room, sufficient for 'TOLERANCE FOR / AMBIGUITY' wrapped on two lines.
+  const VB_X = -90, VB_Y = -30, VB_W = size + 180, VB_H = size + 60;
+
   return (
     <div className="flex items-center justify-center">
-      <svg width={size + 60} height={size + 30} viewBox={`-30 0 ${size + 60} ${size + 30}`} role="img" aria-label="Dimension radar">
+      <svg width="100%" height="auto" viewBox={`${VB_X} ${VB_Y} ${VB_W} ${VB_H}`} role="img" aria-label="Dimension radar" style={{ maxWidth: 380 }}>
         {[0.25, 0.5, 0.75, 1.0].map((scale, i) => (
           <polygon
             key={i}
@@ -410,13 +427,24 @@ function RadarChart({ profiles }) {
         ))}
         {axes.map((a) => <line key={a.id} x1={cx} y1={cy} x2={a.x} y2={a.y} stroke="#1e3a5f" strokeOpacity={0.15} />)}
         <polygon points={polyPoints} fill="#1e3a5f" fillOpacity={0.28} stroke="#1e3a5f" strokeWidth={1.5} />
-        {axes.map((a) => (
-          <text key={a.id + '-l'} x={a.labelX} y={a.labelY} fontSize="8.5" fill="#6b7280"
-                textAnchor={Math.cos(a.angle) > 0.1 ? 'start' : Math.cos(a.angle) < -0.1 ? 'end' : 'middle'}
-                dominantBaseline="middle" letterSpacing="1" style={{ textTransform: 'uppercase' }}>
-            {a.id.replace(/_/g, ' ').slice(0, 12)}
-          </text>
-        ))}
+        {axes.map((a) => {
+          // text-anchor switches based on which side of the radar the label
+          // sits on, so labels never run off into the chart polygon.
+          const anchor = Math.cos(a.angle) > 0.15 ? 'start'
+                       : Math.cos(a.angle) < -0.15 ? 'end'
+                       : 'middle';
+          const lineHeight = 9;
+          const startDy = a.lines.length === 2 ? -lineHeight / 2 : 0;
+          return (
+            <text key={a.id + '-l'} x={a.labelX} y={a.labelY} fontSize="8.5" fill="#6b7280"
+                  textAnchor={anchor} dominantBaseline="middle"
+                  letterSpacing="1" style={{ textTransform: 'uppercase' }}>
+              {a.lines.map((line, idx) => (
+                <tspan key={idx} x={a.labelX} dy={idx === 0 ? startDy : lineHeight}>{line}</tspan>
+              ))}
+            </text>
+          );
+        })}
       </svg>
     </div>
   );

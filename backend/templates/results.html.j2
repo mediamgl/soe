@@ -103,6 +103,11 @@ td { padding: 5pt 7pt; border-bottom: 1px solid #eee; vertical-align: top; }
 .kv { margin: 2pt 0; }
 .kv b { color: #1e3a5f; font-weight: 600; }
 .intra-section { page-break-inside: avoid; }
+.radar-section { page-break-inside: avoid; text-align: center; }
+.radar-title { font-family: 'Source Serif Pro', 'Times New Roman', serif; color: #1e3a5f; font-size: 13pt; font-weight: 600; margin: 0 0 8pt 0; text-align: center; }
+.radar-wrap { margin: 0 auto; }
+.radar-wrap svg { display: block; margin: 0 auto; }
+.radar-caption { margin-top: 6pt; font-size: 9pt; color: #3c4b66; font-style: italic; text-align: center; }
 </style>
 </head>
 <body>
@@ -140,6 +145,14 @@ td { padding: 5pt 7pt; border-bottom: 1px solid #eee; vertical-align: top; }
 
   <p><em>{{ deliverable.executive_summary.bottom_line }}</em></p>
 </section>
+
+{% if radar_svg %}
+<section class="section radar-section">
+  <h3 class="radar-title">Dimension overview</h3>
+  <div class="radar-wrap">{{ radar_svg }}</div>
+  <p class="radar-caption">Visual summary of the six assessed dimensions, scored on a 1–5 scale. Detailed profiles for each dimension follow below.</p>
+</section>
+{% endif %}
 
 <section class="section">
   <h2>2. Dimension Profile — Assessed</h2>
