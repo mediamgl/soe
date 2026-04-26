@@ -241,6 +241,10 @@ export default function Scenario() {
         setPhase(r.phase);
         setContent(r.content);
       } else if (phase === 'part1') {
+        // Belt-and-braces: flush any pending 400ms-debounced autosave so
+        // the trio Mongo sees on /advance is at-or-newer than the body
+        // we're submitting. Eliminates the autosave-vs-submit race.
+        await flushNow();
         const r = await scnAdvance(sessionId, 'part1', 'curveball', part1);
         setPhase(r.phase);
         setContent(r.content);
@@ -249,6 +253,11 @@ export default function Scenario() {
         setPhase(r.phase);
         setContent(r.content);
       } else if (phase === 'part2') {
+        // Same belt-and-braces flush as part1 → curveball. Tester's session
+        // showed empty part2 in Mongo despite typing — the broken
+        // QuestionBlock (now hoisted) was the root cause; this flushNow is
+        // an additional safety against any future debounce-race.
+        await flushNow();
         // Scoring will run server-side; this can take 10–30s
         setScoring(true);
         const r = await scnAdvance(sessionId, 'part2', 'done', part2);
@@ -256,7 +265,29 @@ export default function Scenario() {
         setContent({});
       }
     } catch (e) {
-      setErr(apiErrorMessage(e, 'Could not advance.'));
+      const status = apiErrorStatus(e);
+      if (status === 422) {
+        // FastAPI _validate_trio returns plain string detail like
+        //   "payload.q3 must not be empty"
+        //   "payload.q1 exceeds 4000 characters"
+        // Map to a user-friendly Question N message.
+        const detail = apiErrorMessage(e, 'Could not advance.');
+        const m = detail.match(/q([123])/i);
+        if (m) {
+          const qNum = m[1];
+          if (/empty/i.test(detail)) {
+            setErr(`Question ${qNum} needs an answer before you can continue.`);
+          } else if (/exceed/i.test(detail)) {
+            setErr(`Question ${qNum} is too long — please shorten it under 4000 characters.`);
+          } else {
+            setErr(`Question ${qNum}: ${detail}`);
+          }
+        } else {
+          setErr(detail);
+        }
+      } else {
+        setErr(apiErrorMessage(e, "We couldn't save that — please try again."));
+      }
     } finally {
       setAdvancing(false);
       setScoring(false);

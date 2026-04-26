@@ -372,7 +372,7 @@ export default function AIDiscussion() {
 
       {err && <p className="mt-5 text-sm text-red-700">{err}</p>}
 
-      {/* End confirmation modal */}
+      {/* End confirmation modal — copy branches by turn count */}
       {confirmingEnd && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <button
@@ -383,15 +383,37 @@ export default function AIDiscussion() {
             onClick={() => setConfirmingEnd(false)}
           />
           <div className="relative bg-white border border-hairline p-7 max-w-md w-full">
-            <h2 className="font-serif text-xl text-navy">End the conversation now?</h2>
-            <p className="mt-3 text-sm text-ink/75 leading-relaxed">
-              You&rsquo;ve completed {turnCount} of {MAX_USER_TURNS} exchanges. We&rsquo;ll close
-              the discussion and move on to the strategic scenario.
-            </p>
-            <div className="mt-6 flex items-center justify-end gap-3">
-              <button type="button" className="btn-ghost" onClick={() => setConfirmingEnd(false)}>Keep going</button>
-              <button type="button" className="btn-primary" onClick={onEndEarly}>End conversation</button>
-            </div>
+            {turnCount >= MAX_USER_TURNS - 2 ? (
+              // Wrap-up framing — turns 10 or 11. The model is instructed by
+              // Doc 21 to start wrapping up around turn 10, so the assistant
+              // tone has shifted to closing language. Don't frame this as
+              // "early" — it's natural completion.
+              <>
+                <h2 className="font-serif text-xl text-navy">Ready to wrap up?</h2>
+                <p className="mt-3 text-sm text-ink/75 leading-relaxed">
+                  It looks like the conversation has reached a natural close.
+                  Continuing will move you to the strategic scenario.
+                </p>
+                <div className="mt-6 flex items-center justify-end gap-3">
+                  <button type="button" className="btn-ghost" onClick={() => setConfirmingEnd(false)}>Keep going</button>
+                  <button type="button" className="btn-primary" onClick={onEndEarly}>Continue to scenario</button>
+                </div>
+              </>
+            ) : (
+              // Early-exit framing — turns 3..9. The participant is bailing
+              // before the conversation has had time to develop fully.
+              <>
+                <h2 className="font-serif text-xl text-navy">End the conversation now?</h2>
+                <p className="mt-3 text-sm text-ink/75 leading-relaxed">
+                  You&rsquo;ve completed {turnCount} of {MAX_USER_TURNS} exchanges. We&rsquo;ll close
+                  the discussion and move on to the strategic scenario.
+                </p>
+                <div className="mt-6 flex items-center justify-end gap-3">
+                  <button type="button" className="btn-ghost" onClick={() => setConfirmingEnd(false)}>Keep going</button>
+                  <button type="button" className="btn-primary" onClick={onEndEarly}>End conversation</button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

@@ -25,7 +25,25 @@ export default function ResumeModal({ open, onClose }) {
       onClose();
       navigate(path);
     } catch (err) {
-      setError(err.message || 'Resume code not found.');
+      // Diagnostic — non-PII. Helps future debugging if the request misroutes
+      // (preserved by sessionStore.hydrateFromResumeCode → e.status / e.url /
+      // e.bodyExcerpt). No code excerpt is logged so a typed code can't leak.
+      try {
+        // eslint-disable-next-line no-console
+        console.warn('[Resume] failed', {
+          url: err.url,
+          status: err.status ?? 'network',
+          bodyExcerpt: err.bodyExcerpt,
+        });
+      } catch (_) { /* ignore */ }
+
+      if (err.status === 404) {
+        setError('Resume code not found. Please double-check the code (it should be 8 characters with a dash, like ABCD-1234).');
+      } else if (!err.status) {
+        setError("We couldn't reach the server. Check your connection and try again.");
+      } else {
+        setError('Something went wrong. Please try again, or contact support.');
+      }
     } finally {
       setBusy(false);
     }

@@ -107,7 +107,19 @@ export const useSession = create((set, get) => ({
     } catch (err) {
       const msg = apiErrorMessage(err, 'Resume code not found.');
       set({ loading: false, error: msg });
-      throw new Error(msg);
+      // Phase 9 follow-up — preserve status / url / body excerpt on the
+      // thrown error so the ResumeModal can branch its user-visible copy
+      // (404 vs network vs other). Plain `new Error(msg)` would otherwise
+      // strip everything except the message string.
+      const e = new Error(msg);
+      e.status = err && err.response && err.response.status;
+      e.url = (err && err.config && err.config.url) || (err && err.response && err.response.config && err.response.config.url);
+      try {
+        const d = err && err.response && err.response.data;
+        const s = typeof d === 'string' ? d : JSON.stringify(d || {});
+        e.bodyExcerpt = (s || '').slice(0, 80);
+      } catch (_) { e.bodyExcerpt = ''; }
+      throw e;
     }
   },
 
